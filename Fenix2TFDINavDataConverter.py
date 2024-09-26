@@ -115,7 +115,7 @@ def export_db3_to_json(conn, start_terminal_id):
         if terminal_id not in terminal_data:
             terminal_data[terminal_id] = []
 
-        # 为IsFAF和IsMAP添加默认值
+        # IsFAF和IsMAP默认值
         row_dict['IsFAF'] = 0
         row_dict['IsMAP'] = 0 if row_dict['Alt'] != 'MAP' else -1
 
@@ -157,8 +157,7 @@ def export_db3_to_json(conn, start_terminal_id):
             if 0 < i < len(legs) - 1:
                 prev_leg = legs[i - 1]
                 next_leg = legs[i + 1]
-                #确认是否为FAF点                
-                # 检查当前列及之前的列的 Vnav 值是否为空或小于 2.5
+                #判断是否为FAF点                
                 valid = True
                 for j in range(i, -1, -1):
                     vnav_value = legs[j]['Vnav']
@@ -170,8 +169,7 @@ def export_db3_to_json(conn, start_terminal_id):
                     elif vnav_value is not None:
                         valid = False
                         break
-                
-                # 检查下一列的 Vnav 值是否存在且大于 2.5
+
                 if valid and next_leg['Vnav'] is not None and str(next_leg['Vnav']).replace('.', '', 1).isdigit():
                     next_vnav_value = float(next_leg['Vnav'])
                     if next_vnav_value > 2.5:
