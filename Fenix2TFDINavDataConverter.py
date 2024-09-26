@@ -15,24 +15,23 @@ required_tables = set([
 
 def get_db3_file_path(prompt):
     while True:
-        file_path = input(prompt).strip().strip('\'"')  # 去除首尾空格和引号
+        file_path = input(prompt).strip().strip('\'"') 
         if os.path.exists(file_path) and file_path.endswith('.db3'):
             conn = sqlite3.connect(file_path)
             tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()
             tables = set([table[0] for table in tables])
             if required_tables.issubset(tables):
-                return conn  # 返回有效的数据库连接对象
+                return conn
             else:
                 print("所读取文件不是fenix数据库格式，请重新输入db3文件路径：")
-                conn.close()  # 关闭错误的数据库连接
+                conn.close()
         else:
             print(f"文件路径无效或不是一个.db3文件，请重新输入。")
 
 def get_terminal_id():
     terminal_id = input("请输入要转换的起始TerminalID：")
     return terminal_id
-            
-# 如果目录不存在，则创建它
+
 if not os.path.exists('Primary/ProcedureLegs'):
     os.makedirs('Primary/ProcedureLegs')
 
@@ -158,7 +157,7 @@ def export_db3_to_json(conn, start_terminal_id):
             if 0 < i < len(legs) - 1:
                 prev_leg = legs[i - 1]
                 next_leg = legs[i + 1]
-                
+                #确认是否为FAF点                
                 # 检查当前列及之前的列的 Vnav 值是否为空或小于 2.5
                 valid = True
                 for j in range(i, -1, -1):
@@ -203,15 +202,12 @@ def compress_and_cleanup():
     archive_path = 'Primary.7z'
     with py7zr.SevenZipFile(archive_path, 'w') as archive:
         for root, dirs, files in os.walk('Primary'):
-            # 将文件添加到压缩文件
+            
             for file in files:
                 file_path = os.path.join(root, file)
-                # 计算相对路径，以便在压缩包中创建正确的目录结构
                 relative_path = os.path.relpath(file_path, 'Primary')
                 archive.write(file_path, relative_path)
-            # 不需要处理目录，因为文件会自动处理目录结构
 
-    # 删除 Primary 文件夹及其内容
     shutil.rmtree('Primary')
 if __name__ == "__main__":
     conn = get_db3_file_path("请输入Fenix NDB文件路径：")
