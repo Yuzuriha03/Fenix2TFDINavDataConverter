@@ -1,10 +1,11 @@
-import sqlite3
-import json
+
 import os
 import time
-from collections import OrderedDict
+import json
 import py7zr
 import shutil
+import sqlite3
+from collections import OrderedDict
 
 required_tables = set([
     "AirportCommunication", "AirportLookup", "Airports", "AirwayLegs", "Airways", "config", 
@@ -31,8 +32,7 @@ def get_db3_file_path(prompt):
 def get_terminal_id():
     terminal_id = input("请输入要转换的起始TerminalID：")
     return terminal_id
-            
-# 如果目录不存在，则创建它
+
 if not os.path.exists('Primary/ProcedureLegs'):
     os.makedirs('Primary/ProcedureLegs')
 
