@@ -1,0 +1,14 @@
+target/
+dist/
+Nav-Primary*
+
+# Local navigation database inputs
+*.db3
+
+# Editor-local files
+.DS_Store
+Thumbs.db
+compare_nav_outputs.py
+Cargo.lock
+build_release.ps1
+README.md

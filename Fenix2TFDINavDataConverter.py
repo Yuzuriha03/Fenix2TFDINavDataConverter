@@ -33,8 +33,8 @@ def get_terminal_id():
     terminal_id = input("请输入要转换的起始TerminalID：")
     return terminal_id
 
-if not os.path.exists('Primary/ProcedureLegs'):
-    os.makedirs('Primary/ProcedureLegs')
+if not os.path.exists('Nav-Primary/ProcedureLegs'):
+    os.makedirs('Nav-Primary/ProcedureLegs')
 
 def fetch_waypoints(cursor):
     cursor.execute('SELECT ID, Ident FROM Waypoints')
@@ -94,7 +94,7 @@ def export_db3_to_json(conn, start_terminal_id):
             formatted_row = format_row(row_dict, table_name, waypoints_dict)
             data.append(formatted_row)
 
-        json_file = f'Primary/{table_name}.json'
+        json_file = f'Nav-Primary/{table_name}.json'
         with open(json_file, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, separators=(',', ':'))
 
@@ -190,29 +190,29 @@ def export_db3_to_json(conn, start_terminal_id):
                 ordered_leg[col] = value
             ordered_legs.append(ordered_leg)
 
-        json_file = f'Primary/ProcedureLegs/TermID_{terminal_id}.json'
+        json_file = f'Nav-Primary/ProcedureLegs/TermID_{terminal_id}.json'
         with open(json_file, 'w', encoding='utf-8') as f:
             json.dump(ordered_legs, f, ensure_ascii=False, separators=(',', ':'))
 
     conn.close()
 
 def compress_and_cleanup():
-    # 压缩 Primary 文件夹
-    archive_path = 'Primary.7z'
+    # 压缩 Nav-Primary 文件夹
+    archive_path = 'Nav-Primary.7z'
     with py7zr.SevenZipFile(archive_path, 'w') as archive:
-        for root, dirs, files in os.walk('Primary'):
+        for root, dirs, files in os.walk('Nav-Primary'):
             
             for file in files:
                 file_path = os.path.join(root, file)
-                relative_path = os.path.relpath(file_path, 'Primary')
+                relative_path = os.path.relpath(file_path, 'Nav-Primary')
                 archive.write(file_path, relative_path)
 
-    shutil.rmtree('Primary')
+    shutil.rmtree('Nav-Primary')
 if __name__ == "__main__":
     conn = get_db3_file_path("请输入Fenix NDB文件路径：")
     if conn:
         terminal_id = get_terminal_id()
         export_db3_to_json(conn, terminal_id)
         compress_and_cleanup()
-        print("数据已成功导出并压缩为Primary.7z")
+        print("数据已成功导出并压缩为Nav-Primary.7z")
         time.sleep(2)
