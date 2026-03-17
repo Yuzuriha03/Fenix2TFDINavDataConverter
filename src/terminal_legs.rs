@@ -9,9 +9,9 @@ use rusqlite::{Connection, params, params_from_iter};
 use serde_json::{Map, Number, Value};
 
 use crate::db_json::{
-    configure_read_connection, json_to_i64, sql_value_to_json, write_json,
+    configure_read_connection, json_to_i64, sql_value_to_json, write_json_objects_if_changed,
 };
-use crate::stats::{PhaseDurations, TerminalLegExportStats};
+use crate::stats::{PhaseDurations, TerminalLegExportStats, TerminalLegTimingBreakdown};
 
 #[derive(Clone, Debug)]
 struct TerminalLegRecord {
@@ -131,7 +131,7 @@ impl TerminalLegRecord {
     }
 
     fn to_output_map(&self) -> Map<String, Value> {
-        let mut ordered = Map::new();
+        let mut ordered = Map::with_capacity(25);
         ordered.insert("ID".to_string(), Value::Number(Number::from(self.id)));
         ordered.insert(
             "TerminalID".to_string(),
@@ -192,16 +192,32 @@ pub(crate) fn export_terminal_legs(
     output_dir: &Path,
 ) -> Result<TerminalLegExportStats> {
     let db_read_start = Instant::now();
-    let (terminal_legs, runway_ids_by_terminal, terminal_ids, runway_coords, waypoint_coords) =
-        with_connection(db_path, |conn| {
+    let (
+        terminal_legs,
+        runway_ids_by_terminal,
+        terminal_ids,
+        runway_coords,
+        waypoint_coords,
+        mut detail,
+    ) = with_connection(db_path, |conn| {
+            let t_terminal_legs = Instant::now();
             let terminal_legs = fetch_terminal_legs(conn, start_terminal_id)?;
+            let db_terminal_legs = t_terminal_legs.elapsed();
+
+            let t_terminal_metadata = Instant::now();
             let (runway_ids_by_terminal, terminal_ids) = fetch_terminal_metadata(conn)?;
+            let db_terminal_metadata = t_terminal_metadata.elapsed();
 
             let runway_ids: HashSet<i64> = runway_ids_by_terminal.values().copied().collect();
             let waypoint_ids = collect_waypoint_reference_ids(&terminal_legs);
 
+            let t_runway_coords = Instant::now();
             let runway_coords = fetch_runway_coordinates_by_ids(conn, &runway_ids)?;
+            let db_runway_coords = t_runway_coords.elapsed();
+
+            let t_waypoint_coords = Instant::now();
             let waypoint_coords = fetch_waypoint_coordinates_by_ids(conn, &waypoint_ids)?;
+            let db_waypoint_coords = t_waypoint_coords.elapsed();
 
             Ok::<_, anyhow::Error>(
                 (
@@ -210,6 +226,13 @@ pub(crate) fn export_terminal_legs(
                     terminal_ids,
                     runway_coords,
                     waypoint_coords,
+                    TerminalLegTimingBreakdown {
+                        db_terminal_legs,
+                        db_terminal_metadata,
+                        db_runway_coords,
+                        db_waypoint_coords,
+                        ..Default::default()
+                    },
                 ),
             )
         })?;
@@ -231,23 +254,24 @@ pub(crate) fn export_terminal_legs(
         .collect();
     let file_count = terminal_jobs.len();
     let json_transform_time = json_transform_start.elapsed();
+    detail.group_rows = json_transform_time;
 
     let json_write_start = Instant::now();
     terminal_jobs
         .into_par_iter()
         .try_for_each(|(terminal_id, mut legs)| {
             mark_final_approach_fix(&mut legs);
-            let ordered_legs: Vec<Value> = legs
-                .iter()
-                .map(|leg| Value::Object(leg.to_output_map()))
-                .collect();
+            let ordered_legs: Vec<Map<String, Value>> =
+                legs.iter().map(TerminalLegRecord::to_output_map).collect();
             let output_path = output_dir
                 .join("ProcedureLegs")
                 .join(format!("TermID_{terminal_id}.json"));
-            write_json(&output_path, &ordered_legs)
+            write_json_objects_if_changed(&output_path, &ordered_legs).map(|_| ())
         })?;
 
+    let cleanup_start = Instant::now();
     let _ = cleanup_extra_procedure_files(output_dir, &terminal_ids)?;
+    detail.cleanup_files = cleanup_start.elapsed();
 
     Ok(TerminalLegExportStats {
         row_count,
@@ -257,6 +281,7 @@ pub(crate) fn export_terminal_legs(
             json_transform: json_transform_time,
             json_write: json_write_start.elapsed(),
         },
+        detail,
     })
 }
 

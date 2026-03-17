@@ -4,7 +4,7 @@ use serde_json::{Map, Number, Value};
 
 use crate::db_json::{json_text, json_to_i64};
 
-use super::AirwayReferenceData;
+use super::{AirwayLegReferenceRow, AirwayReferenceData};
 
 type AirwayRows = Vec<Map<String, Value>>;
 type AirwayMergeOutput = (AirwayRows, AirwayRows);
@@ -72,10 +72,17 @@ pub(super) fn merge_airway_outputs(
     let mut final_airway_by_ident = build_airway_row_map_by_ident(&airway_reference.airways);
 
     let source_legs_by_ident = group_airway_legs_by_ident(source_legs, &source_ident_by_id);
-    let mut final_legs_by_ident = group_airway_legs_by_ident(&airway_reference.airway_legs, &reference_ident_by_id);
+    let mut final_legs_by_ident =
+        group_reference_airway_legs_by_ident(&airway_reference.airway_legs, &reference_ident_by_id);
 
     let mut next_airway_id = next_id_from_rows(&airway_reference.airways, "ID");
-    let mut next_leg_id = next_id_from_rows(&airway_reference.airway_legs, "ID");
+    let mut next_leg_id = airway_reference
+        .airway_legs
+        .iter()
+        .map(|row| row.id)
+        .max()
+        .unwrap_or(0)
+        + 1;
 
     let mut source_idents: Vec<String> = source_airway_by_ident.keys().cloned().collect();
     source_idents.sort();
@@ -218,6 +225,20 @@ fn group_airway_legs_by_ident(
     grouped
 }
 
+fn group_reference_airway_legs_by_ident(
+    rows: &[AirwayLegReferenceRow],
+    airway_ident_by_id: &HashMap<i64, String>,
+) -> HashMap<String, Vec<Map<String, Value>>> {
+    let mut grouped: HashMap<String, Vec<Map<String, Value>>> = HashMap::new();
+    for row in rows {
+        let Some(ident) = airway_ident_by_id.get(&row.airway_id) else {
+            continue;
+        };
+        grouped.entry(ident.clone()).or_default().push(row.to_map());
+    }
+    grouped
+}
+
 fn has_connection(source_chains: &[Chain], existing_legs: &[Map<String, Value>]) -> bool {
     if source_chains.is_empty() || existing_legs.is_empty() {
         return false;
@@ -248,42 +269,83 @@ fn path_distance(chain: &Chain, left: &str, right: &str) -> Option<usize> {
 }
 
 fn extract_chains(rows: &[Map<String, Value>]) -> Vec<Chain> {
-    let mut sorted = rows.to_vec();
-    sorted.sort_by_key(|row| json_to_i64(row.get("ID")).unwrap_or(i64::MAX));
-
     let mut chains = Vec::new();
     let mut current_points: Vec<String> = Vec::new();
 
-    for row in sorted {
-        let from = json_text(row.get("Waypoint1"));
-        let to = json_text(row.get("Waypoint2"));
-        if from.is_empty() || to.is_empty() {
-            continue;
-        }
+    let is_sorted_by_id = rows.windows(2).all(|window| {
+        let left = json_to_i64(window[0].get("ID")).unwrap_or(i64::MAX);
+        let right = json_to_i64(window[1].get("ID")).unwrap_or(i64::MAX);
+        left <= right
+    });
 
-        let is_start = json_to_i64(row.get("IsStart")) == Some(1);
-        if is_start || current_points.is_empty() {
-            if current_points.len() >= 2 {
-                chains.push(Chain::from_points(std::mem::take(&mut current_points)));
+    if is_sorted_by_id {
+        for row in rows {
+            let from = json_text(row.get("Waypoint1"));
+            let to = json_text(row.get("Waypoint2"));
+            if from.is_empty() || to.is_empty() {
+                continue;
             }
-            current_points.push(from.clone());
-            current_points.push(to.clone());
-        } else {
-            if current_points.last().map(|p| p.as_str()) != Some(from.as_str()) {
+
+            let is_start = json_to_i64(row.get("IsStart")) == Some(1);
+            if is_start || current_points.is_empty() {
                 if current_points.len() >= 2 {
                     chains.push(Chain::from_points(std::mem::take(&mut current_points)));
                 }
                 current_points.push(from.clone());
-            }
-            current_points.push(to.clone());
-        }
-
-        let is_end = json_to_i64(row.get("IsEnd")) == Some(1);
-        if is_end {
-            if current_points.len() >= 2 {
-                chains.push(Chain::from_points(std::mem::take(&mut current_points)));
+                current_points.push(to.clone());
             } else {
-                current_points.clear();
+                if current_points.last().map(|p| p.as_str()) != Some(from.as_str()) {
+                    if current_points.len() >= 2 {
+                        chains.push(Chain::from_points(std::mem::take(&mut current_points)));
+                    }
+                    current_points.push(from.clone());
+                }
+                current_points.push(to.clone());
+            }
+
+            let is_end = json_to_i64(row.get("IsEnd")) == Some(1);
+            if is_end {
+                if current_points.len() >= 2 {
+                    chains.push(Chain::from_points(std::mem::take(&mut current_points)));
+                } else {
+                    current_points.clear();
+                }
+            }
+        }
+    } else {
+        let mut sorted_rows_storage = rows.to_vec();
+        sorted_rows_storage.sort_by_key(|row| json_to_i64(row.get("ID")).unwrap_or(i64::MAX));
+        for row in &sorted_rows_storage {
+            let from = json_text(row.get("Waypoint1"));
+            let to = json_text(row.get("Waypoint2"));
+            if from.is_empty() || to.is_empty() {
+                continue;
+            }
+
+            let is_start = json_to_i64(row.get("IsStart")) == Some(1);
+            if is_start || current_points.is_empty() {
+                if current_points.len() >= 2 {
+                    chains.push(Chain::from_points(std::mem::take(&mut current_points)));
+                }
+                current_points.push(from.clone());
+                current_points.push(to.clone());
+            } else {
+                if current_points.last().map(|p| p.as_str()) != Some(from.as_str()) {
+                    if current_points.len() >= 2 {
+                        chains.push(Chain::from_points(std::mem::take(&mut current_points)));
+                    }
+                    current_points.push(from.clone());
+                }
+                current_points.push(to.clone());
+            }
+
+            let is_end = json_to_i64(row.get("IsEnd")) == Some(1);
+            if is_end {
+                if current_points.len() >= 2 {
+                    chains.push(Chain::from_points(std::mem::take(&mut current_points)));
+                } else {
+                    current_points.clear();
+                }
             }
         }
     }
@@ -453,7 +515,7 @@ fn apply_mirror_rows(
             continue;
         }
 
-        let mut mirrored = row.clone();
+        let mut mirrored = row;
         mirrored.insert("ID".to_string(), Value::Number(Number::from(*next_leg_id)));
         *next_leg_id += 1;
         swap(&mut mirrored, "Waypoint1ID", "Waypoint2ID");

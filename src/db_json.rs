@@ -6,6 +6,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use encoding_rs::GBK;
 use rusqlite::Connection;
+use rusqlite::params;
 use rusqlite::types::Value as SqlValue;
 use serde_json::{Map, Number, Value};
 
@@ -34,6 +35,28 @@ pub(crate) fn fetch_table_rows(
         .with_context(|| format!("failed to iterate table {table_name}"))?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .with_context(|| format!("failed to read table {table_name}"))
+}
+
+pub(crate) fn fetch_table_rows_after_id(
+    conn: &Connection,
+    table_name: &str,
+    min_exclusive_id: i64,
+) -> Result<Vec<Map<String, Value>>> {
+    let base_sql = table_select_sql(conn, table_name)?;
+    let sql = format!("{base_sql} WHERE ID > ?");
+    let mut statement = conn
+        .prepare(&sql)
+        .with_context(|| format!("failed to query table {table_name} incrementally"))?;
+    let column_names: Vec<String> = statement
+        .column_names()
+        .into_iter()
+        .map(|name| name.to_string())
+        .collect();
+    let rows = statement
+        .query_map(params![min_exclusive_id], |row| row_to_map(row, &column_names))
+        .with_context(|| format!("failed to iterate table {table_name} incrementally"))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .with_context(|| format!("failed to read incremental rows from table {table_name}"))
 }
 
 fn table_select_sql(conn: &Connection, table_name: &str) -> Result<String> {
@@ -239,15 +262,6 @@ pub(crate) fn json_text(value: Option<&Value>) -> String {
     }
 }
 
-pub(crate) fn write_json(path: &Path, data: &[Value]) -> Result<()> {
-    let file =
-        File::create(path).with_context(|| format!("failed to create file: {}", path.display()))?;
-    let writer = BufWriter::with_capacity(1024 * 1024, file);
-    serde_json::to_writer(writer, data)
-        .with_context(|| format!("failed to write json: {}", path.display()))?;
-    Ok(())
-}
-
 pub(crate) fn write_json_objects(path: &Path, rows: &[Map<String, Value>]) -> Result<()> {
     let file =
         File::create(path).with_context(|| format!("failed to create file: {}", path.display()))?;
@@ -257,6 +271,21 @@ pub(crate) fn write_json_objects(path: &Path, rows: &[Map<String, Value>]) -> Re
     Ok(())
 }
 
+pub(crate) fn write_json_objects_if_changed(path: &Path, rows: &[Map<String, Value>]) -> Result<bool> {
+    let encoded = serde_json::to_vec(rows)
+        .with_context(|| format!("failed to encode json objects: {}", path.display()))?;
+
+    if let Ok(existing) = fs::read(path)
+        && existing == encoded
+    {
+        return Ok(false);
+    }
+
+    fs::write(path, encoded)
+        .with_context(|| format!("failed to write json objects: {}", path.display()))?;
+    Ok(true)
+}
+
 pub(crate) fn read_text_gbk(path: &Path) -> Result<String> {
     let bytes =
         fs::read(path).with_context(|| format!("failed to read file: {}", path.display()))?;
@@ -264,25 +293,11 @@ pub(crate) fn read_text_gbk(path: &Path) -> Result<String> {
     Ok(decoded.into_owned())
 }
 
-pub(crate) fn read_json_array(path: &Path) -> Result<Vec<Value>> {
+pub(crate) fn read_json_object_array(path: &Path) -> Result<Vec<Map<String, Value>>> {
     let file = File::open(path)
         .with_context(|| format!("failed to open json file: {}", path.display()))?;
-    let json: Value = serde_json::from_reader(file)
-        .with_context(|| format!("failed to parse json file: {}", path.display()))?;
-    match json {
-        Value::Array(items) => Ok(items),
-        _ => bail!("top-level json value is not an array: {}", path.display()),
-    }
-}
-
-pub(crate) fn read_json_object_array(path: &Path) -> Result<Vec<Map<String, Value>>> {
-    read_json_array(path)?
-        .into_iter()
-        .map(|value| match value {
-            Value::Object(object) => Ok(object),
-            _ => bail!("json array member is not an object: {}", path.display()),
-        })
-        .collect()
+    serde_json::from_reader(file)
+        .with_context(|| format!("failed to parse json object array: {}", path.display()))
 }
 
 pub(crate) fn trim_csv_field(field: &str) -> &str {

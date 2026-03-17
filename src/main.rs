@@ -42,6 +42,8 @@ fn main() {
 fn run() -> Result<()> {
     let config = parse_args()?;
     let total_start = Instant::now();
+
+    let resolve_paths_start = Instant::now();
     let rte_seg_path = match &config.rte_seg_path {
         Some(path) => path.clone(),
         None => prompt_rte_seg_path()?,
@@ -51,22 +53,40 @@ fn run() -> Result<()> {
         Some(path) => path.clone(),
         None => prompt_db3_path()?,
     };
+    let resolve_paths_time = resolve_paths_start.elapsed();
 
-    let airway_reference = load_airway_reference(config.reference_dir.as_deref(), &rte_seg_path)?;
+    let load_airway_reference_start = Instant::now();
+    let (airway_reference, airway_reference_load_timing) =
+        load_airway_reference(config.reference_dir.as_deref(), &rte_seg_path)?;
+    let load_airway_reference_time = load_airway_reference_start.elapsed();
 
+    let validate_db_start = Instant::now();
     let conn = Connection::open(&db_path)
         .with_context(|| format!("failed to open database: {}", db_path.display()))?;
     configure_read_connection(&conn);
     validate_required_tables(&conn)?;
     drop(conn);
+    let validate_db_time = validate_db_start.elapsed();
+
+    let mut detect_start_terminal_total = Duration::default();
+    let mut prepare_output_total = Duration::default();
+    let mut export_total = Duration::default();
 
     for output in &config.output_targets {
+        let detect_start_terminal_start = Instant::now();
         let start_terminal_id = match config.start_terminal_id {
             Some(value) => value,
             None => detect_start_terminal_id(&output.path)?,
         };
-        prepare_output_directory(&output.path)?;
+        let detect_start_terminal_time = detect_start_terminal_start.elapsed();
+        detect_start_terminal_total += detect_start_terminal_time;
 
+        let prepare_output_start = Instant::now();
+        prepare_output_directory(&output.path)?;
+        let prepare_output_time = prepare_output_start.elapsed();
+        prepare_output_total += prepare_output_time;
+
+        let export_start = Instant::now();
         let export_stats = export_db3_to_json(
             &db_path,
             start_terminal_id,
@@ -75,9 +95,15 @@ fn run() -> Result<()> {
             &airway_reference,
             &rte_seg_path,
         )?;
+        export_total += export_start.elapsed();
 
+        println!("--- Export for {} ---", output.path.display());
         if config.debug {
-            println!("--- Export for {} ---", output.path.display());
+            println!(
+                "Pre-export: detect TerminalID {} | prepare output {}",
+                format_duration(detect_start_terminal_time),
+                format_duration(prepare_output_time),
+            );
             print_export_stats(&export_stats);
             println!("DEBUG output: {}", output.path.display());
             if let Some(reference_dir) = &config.reference_dir {
@@ -93,7 +119,33 @@ fn run() -> Result<()> {
         }
     }
 
-    if !config.debug {
+    if config.debug {
+        let pre_export_subtotal = resolve_paths_time + load_airway_reference_time + validate_db_time;
+        println!("\nRun timing:");
+        println!(
+            "  Pre-export pipeline: resolve paths {} | load airway reference {} | validate DB {} | subtotal {}",
+            format_duration(resolve_paths_time),
+            format_duration(load_airway_reference_time),
+            format_duration(validate_db_time),
+            format_duration(pre_export_subtotal),
+        );
+        println!(
+            "  Airway reference detail: mirror {} | Airways.json {} | AirwayLegs.json {}",
+            format_duration(airway_reference_load_timing.mirror_reference),
+            format_duration(airway_reference_load_timing.airways_json),
+            format_duration(airway_reference_load_timing.airway_legs_json),
+        );
+        println!(
+            "  Per-target pre-export sum: detect TerminalID {} | prepare output {}",
+            format_duration(detect_start_terminal_total),
+            format_duration(prepare_output_total),
+        );
+        println!(
+            "  Export wall (all targets): {}",
+            format_duration(export_total),
+        );
+        println!("  Total elapsed: {}", format_duration(total_start.elapsed()));
+    } else {
         println!("Total elapsed: {}", format_duration(total_start.elapsed()));
     }
 
@@ -155,7 +207,8 @@ fn export_db3_to_json(
     let (mut table_stats, table_export_wall) = table_export_result?;
     table_stats.insert(0, waypoint_table_stats);
     table_stats.insert(1, runway_table_stats);
-    table_stats.extend(airway_export_result?);
+    let (airway_stats, airway_detail) = airway_export_result?;
+    table_stats.extend(airway_stats);
     let (terminal_leg_stats, terminal_leg_wall) = terminal_legs_result?;
     table_stats.sort_by(|left, right| left.table_name.cmp(&right.table_name));
 
@@ -164,6 +217,7 @@ fn export_db3_to_json(
         waypoint_index_wall: waypoint_read_time,
         table_stats,
         table_export_wall,
+        airway_detail,
         terminal_leg_stats,
         terminal_leg_wall,
         total_elapsed: export_start.elapsed(),
@@ -217,6 +271,40 @@ fn print_export_stats(stats: &ExportStats) {
         format_duration(stats.terminal_leg_stats.phase.json_write),
         format_duration(stats.terminal_leg_stats.phase.total())
     );
+
+    println!(
+        "  ProcedureLegs detail: legs-query {} | terminal-meta {} | runway-coords {} | waypoint-coords {} | group {} | cleanup {}",
+        format_duration(stats.terminal_leg_stats.detail.db_terminal_legs),
+        format_duration(stats.terminal_leg_stats.detail.db_terminal_metadata),
+        format_duration(stats.terminal_leg_stats.detail.db_runway_coords),
+        format_duration(stats.terminal_leg_stats.detail.db_waypoint_coords),
+        format_duration(stats.terminal_leg_stats.detail.group_rows),
+        format_duration(stats.terminal_leg_stats.detail.cleanup_files),
+    );
+
+    println!(
+        "  Airways detail: waypoint-candidates {} | rte-seg-build {} | merge {} | write-airways {} | write-airwaylegs {}",
+        format_duration(stats.airway_detail.waypoint_candidates_load),
+        format_duration(stats.airway_detail.build_from_rte_seg),
+        format_duration(stats.airway_detail.merge_outputs),
+        format_duration(stats.airway_detail.write_airways),
+        format_duration(stats.airway_detail.write_airway_legs),
+    );
+
+    println!("  Table detail:");
+    for table in &stats.table_stats {
+        if let Some(detail) = &table.detail {
+            println!(
+                "    {:<15} source {:>7} -> formatted {:>7} | existing-load {} | format {} | merge {}",
+                table.table_name,
+                detail.source_rows,
+                detail.formatted_rows,
+                format_duration(detail.existing_load),
+                format_duration(detail.format_rows),
+                format_duration(detail.merge_rows),
+            );
+        }
+    }
 }
 
 fn format_duration(duration: Duration) -> String {

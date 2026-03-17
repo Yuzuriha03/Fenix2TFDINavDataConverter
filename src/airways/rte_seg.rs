@@ -4,6 +4,7 @@ use std::path::Path;
 
 use anyhow::{Result, anyhow, bail};
 use rusqlite::Connection;
+use rusqlite::params_from_iter;
 use serde_json::{Map, Number, Value};
 
 use crate::db_json::{
@@ -65,42 +66,71 @@ struct DirectedAirwaySegment {
 
 pub(super) fn load_waypoint_candidates_from_db(
     db_path: &Path,
+    required_idents: &HashSet<String>,
 ) -> Result<HashMap<String, Vec<WaypointCandidate>>> {
+    if required_idents.is_empty() {
+        return Ok(HashMap::new());
+    }
+
     let conn = Connection::open(db_path)?;
     configure_read_connection(&conn);
 
     let longitude_col = resolve_waypoint_longitude_column(&conn)?;
-    let sql = format!(
-        "SELECT ID, Ident, Latitude, {longitude_col} FROM Waypoints WHERE Ident IS NOT NULL AND Latitude IS NOT NULL AND {longitude_col} IS NOT NULL"
-    );
-    let mut statement = conn.prepare(&sql)?;
-    let rows = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, f64>(2)?,
-            row.get::<_, f64>(3)?,
-        ))
-    })?;
 
     let mut candidates: HashMap<String, Vec<WaypointCandidate>> = HashMap::new();
-    for row in rows {
-        let (id, ident, latitude, longitude) = row?;
-        let ident = ident.trim();
-        if ident.is_empty() {
-            continue;
-        }
+    let mut ident_list: Vec<String> = required_idents.iter().cloned().collect();
+    ident_list.sort();
+    for chunk in ident_list.chunks(900) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT ID, Ident, Latitude, {longitude_col} FROM Waypoints WHERE Ident IN ({placeholders}) AND Latitude IS NOT NULL AND {longitude_col} IS NOT NULL"
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(chunk.iter()), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f64>(2)?,
+                row.get::<_, f64>(3)?,
+            ))
+        })?;
 
-        candidates
-            .entry(ident.to_string())
-            .or_default()
-            .push(WaypointCandidate {
-                id,
-                latitude,
-                longitude,
-            });
+        for row in rows {
+            let (id, ident, latitude, longitude) = row?;
+            let ident = ident.trim();
+            if ident.is_empty() {
+                continue;
+            }
+
+            candidates
+                .entry(ident.to_string())
+                .or_default()
+                .push(WaypointCandidate {
+                    id,
+                    latitude,
+                    longitude,
+                });
+        }
     }
     Ok(candidates)
+}
+
+pub(super) fn load_required_waypoint_idents_from_rte_seg(
+    rte_seg_path: &Path,
+) -> Result<HashSet<String>> {
+    let rows = parse_rte_seg_airway_rows(rte_seg_path)?;
+    let mut idents = HashSet::new();
+    for row in rows {
+        if !row.start_ident.trim().is_empty() {
+            idents.insert(row.start_ident);
+        }
+        if !row.end_ident.trim().is_empty() {
+            idents.insert(row.end_ident);
+        }
+    }
+    Ok(idents)
 }
 
 fn resolve_waypoint_longitude_column(conn: &Connection) -> Result<&'static str> {
