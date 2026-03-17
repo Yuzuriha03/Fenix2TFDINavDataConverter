@@ -1,6 +1,7 @@
 target/
 dist/
 Nav-Primary*
+.vscode
 __pycache__
 # Local navigation database inputs
 *.db3
