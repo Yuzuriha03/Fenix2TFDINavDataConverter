@@ -602,9 +602,7 @@ fn apply_mirror_rows(
             let level = row_text(row, "Level");
             let from = row_text(row, "Waypoint1");
             let to = row_text(row, "Waypoint2");
-            if from.is_empty() || to.is_empty() {
-                None
-            } else if !mirror_reference.should_mirror(ident, level, from, to) {
+            if from.is_empty() || to.is_empty() || !mirror_reference.should_mirror(ident, level, from, to) {
                 None
             } else {
                 let reverse = directed_edge(level, to, from);

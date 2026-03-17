@@ -287,7 +287,7 @@ pub(crate) fn export_airway_tables(
 
     let airway_transform_start = Instant::now();
     let (formatted_airways, formatted_legs) =
-        rte_seg::build_airway_tables_from_rows(rte_seg_rows, &waypoint_candidates);
+        rte_seg::build_airway_tables_from_rows(rte_seg_rows, waypoint_candidates);
     let airway_transform_time = airway_transform_start.elapsed();
 
     let airway_leg_transform_start = Instant::now();

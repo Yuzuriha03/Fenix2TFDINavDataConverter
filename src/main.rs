@@ -21,12 +21,11 @@ use airways::{
     preload_airway_reference_json, preload_waypoint_candidates,
 };
 use config::{
-    OutputLocation, debug_sample_dir, detect_start_terminal_id, parse_args,
-    prepare_debug_output_from_reference, prepare_output_directory, prompt_db3_path,
-    prompt_rte_seg_path, validate_required_tables,
+    OutputLocation, detect_start_terminal_id, parse_args, prepare_output_directory,
+    prompt_db3_path, prompt_rte_seg_path, validate_required_tables,
 };
 use db_json::configure_read_connection;
-use stats::{ExportStats, PhaseDurations};
+use stats::ExportStats;
 use tables::{ExistingJsonIndex, export_table_to_json, preload_existing_table_indices};
 use terminal_legs::export_terminal_legs;
 
@@ -47,22 +46,16 @@ struct ResolvedInputPaths {
     rte_seg_path: PathBuf,
     db_path: PathBuf,
     db_validated_during_prompt: bool,
-    non_debug_total_start: Option<Instant>,
 }
 
 #[derive(Clone, Debug, Default)]
 struct OutputPrewarmResult {
     start_terminal_id: Option<i64>,
-    detect_start_terminal_time: Duration,
-    prepare_output_time: Duration,
 }
 
 #[derive(Debug)]
 struct OutputExecutionResult {
     output: OutputLocation,
-    detect_start_terminal_time: Duration,
-    prepare_output_time: Duration,
-    export_stats: ExportStats,
 }
 
 type PreloadedTableIndicesByName = HashMap<String, ExistingJsonIndex>;
@@ -72,7 +65,6 @@ struct SharedAirwayReferenceContext {
     airway_reference: AirwayReferenceData,
     load_timing: AirwayReferenceLoadTiming,
     load_time: Duration,
-    seed_copy_time: Duration,
 }
 
 enum AirwayReferenceSource<'a> {
@@ -81,6 +73,30 @@ enum AirwayReferenceSource<'a> {
         airway_reference: &'a AirwayReferenceData,
     },
     PerTarget,
+}
+
+struct ExecuteOutputTargetParams<'a> {
+    output: OutputLocation,
+    prewarmed: Option<&'a OutputPrewarmResult>,
+    db_path: &'a Path,
+    rte_seg_path: &'a Path,
+    preloaded_rte_seg: &'a PreloadedRteSegData,
+    preloaded_waypoint_candidates: &'a PreloadedWaypointCandidates,
+    preloaded_reference_json: Option<PreloadedAirwayReferenceJson>,
+    preloaded_existing_indices: Option<PreloadedTableIndicesByName>,
+    reference_source: AirwayReferenceSource<'a>,
+}
+
+struct ExportDb3ToJsonParams<'a> {
+    db_path: &'a Path,
+    start_terminal_id: i64,
+    output_dir: &'a Path,
+    base_json_dir: Option<&'a Path>,
+    airway_reference: &'a airways::AirwayReferenceData,
+    rte_seg_path: &'a Path,
+    preloaded_rte_seg: &'a PreloadedRteSegData,
+    preloaded_waypoint_candidates: &'a PreloadedWaypointCandidates,
+    preloaded_existing_indices: Option<PreloadedTableIndicesByName>,
 }
 
 fn main() {
@@ -92,31 +108,21 @@ fn main() {
 
 fn run() -> Result<()> {
     let config = parse_args()?;
-    let overall_start = Instant::now();
     let prewarm_handle = start_output_prewarm(&config);
     let airway_reference_json_prewarm_handle = start_airway_reference_json_prewarm(&config);
     let table_index_prewarm_handle = start_table_index_prewarm(&config);
 
-    let resolve_paths_start = Instant::now();
     let (resolved_paths, rte_seg_prewarm_handle) = resolve_input_paths(&config)?;
-    let resolve_paths_time = resolve_paths_start.elapsed();
-    let total_start = if config.debug {
-        overall_start
-    } else {
-        resolved_paths
-            .non_debug_total_start
-            .unwrap_or(overall_start)
-    };
+    let total_start = Instant::now();
     let prewarmed_outputs = join_output_prewarm(prewarm_handle)?;
     let mut preloaded_table_indices = join_table_index_prewarm(table_index_prewarm_handle)?;
 
     let (
         output_results,
-        debug_seed_copy_time,
-        load_airway_reference_time,
-        airway_reference_load_timing,
-        validate_db_time,
-        export_total,
+        _load_airway_reference_time,
+        _airway_reference_load_timing,
+        _validate_db_time,
+        _export_total,
     ) = if config.output_targets.len() > 1 {
         let (preloaded_airway_result, validate_result) = rayon::join(
             || {
@@ -165,17 +171,18 @@ fn run() -> Result<()> {
             .into_par_iter()
             .map(
                 |(output, preloaded_reference_json, preloaded_existing_indices)| {
-                    execute_output_target(
-                        output.clone(),
-                        prewarmed_outputs.get(&output.path),
-                        &resolved_paths.db_path,
-                        &resolved_paths.rte_seg_path,
-                        &preloaded_rte_seg,
-                        &preloaded_waypoint_candidates,
+                    let prewarmed = prewarmed_outputs.get(&output.path);
+                    execute_output_target(ExecuteOutputTargetParams {
+                        output,
+                        prewarmed,
+                        db_path: &resolved_paths.db_path,
+                        rte_seg_path: &resolved_paths.rte_seg_path,
+                        preloaded_rte_seg: &preloaded_rte_seg,
+                        preloaded_waypoint_candidates: &preloaded_waypoint_candidates,
                         preloaded_reference_json,
                         preloaded_existing_indices,
-                        AirwayReferenceSource::PerTarget,
-                    )
+                        reference_source: AirwayReferenceSource::PerTarget,
+                    })
                 },
             )
             .collect::<Vec<_>>();
@@ -184,7 +191,6 @@ fn run() -> Result<()> {
             parallel_results
                 .into_iter()
                 .collect::<Result<Vec<OutputExecutionResult>>>()?,
-            Duration::default(),
             Duration::default(),
             AirwayReferenceLoadTiming::default(),
             validate_db_time,
@@ -236,21 +242,20 @@ fn run() -> Result<()> {
         let export_start = Instant::now();
 
         (
-            vec![execute_output_target(
-                config.output_targets[0].clone(),
-                prewarmed_outputs.get(&config.output_targets[0].path),
-                &resolved_paths.db_path,
-                &resolved_paths.rte_seg_path,
-                &preloaded_rte_seg,
-                &preloaded_waypoint_candidates,
-                None,
+            vec![execute_output_target(ExecuteOutputTargetParams {
+                output: config.output_targets[0].clone(),
+                prewarmed: prewarmed_outputs.get(&config.output_targets[0].path),
+                db_path: &resolved_paths.db_path,
+                rte_seg_path: &resolved_paths.rte_seg_path,
+                preloaded_rte_seg: &preloaded_rte_seg,
+                preloaded_waypoint_candidates: &preloaded_waypoint_candidates,
+                preloaded_reference_json: None,
                 preloaded_existing_indices,
-                AirwayReferenceSource::Shared {
+                reference_source: AirwayReferenceSource::Shared {
                     base_json_dir: shared_reference.runtime_reference_dir.as_deref(),
                     airway_reference: &shared_reference.airway_reference,
                 },
-            )?],
-            shared_reference.seed_copy_time,
+            })?],
             shared_reference.load_time,
             shared_reference.load_timing,
             validate_db_time,
@@ -258,75 +263,15 @@ fn run() -> Result<()> {
         )
     };
 
-    let detect_start_terminal_total: Duration = output_results
-        .iter()
-        .map(|result| result.detect_start_terminal_time)
-        .sum();
-    let prepare_output_total: Duration = output_results
-        .iter()
-        .map(|result| result.prepare_output_time)
-        .sum();
-
     for result in &output_results {
-        println!("--- Export for {} ---", result.output.path.display());
-        if config.debug {
-            println!(
-                "Pre-export: detect TerminalID {} | prepare output {}",
-                format_duration(result.detect_start_terminal_time),
-                format_duration(result.prepare_output_time),
-            );
-            print_export_stats(&result.export_stats);
-            println!("DEBUG output: {}", result.output.path.display());
-            println!("DEBUG sample baseline: {}", debug_sample_dir().display());
-            if let Some(reference_dir) = &config.reference_dir {
-                println!(
-                    "Reference base: {} ({})",
-                    config.output_label,
-                    reference_dir.display()
-                );
-            }
-            println!("RTE_SEG.csv: {}", resolved_paths.rte_seg_path.display());
-        } else {
-            println!(
-                "Updated {} ({})",
-                result.output.label,
-                result.output.path.display()
-            );
-        }
+        println!(
+            "Updated {} ({})",
+            result.output.label,
+            result.output.path.display()
+        );
     }
 
-    if config.debug {
-        let pre_export_subtotal =
-            resolve_paths_time + load_airway_reference_time + validate_db_time;
-        let total_elapsed = total_start.elapsed().saturating_sub(debug_seed_copy_time);
-        println!("\nRun timing:");
-        println!(
-            "  Pre-export pipeline: seed output {} | resolve paths {} | load airway reference {} | validate DB {} | subtotal {}",
-            format_duration(debug_seed_copy_time),
-            format_duration(resolve_paths_time),
-            format_duration(load_airway_reference_time),
-            format_duration(validate_db_time),
-            format_duration(pre_export_subtotal),
-        );
-        println!(
-            "  Airway reference detail: mirror {} | Airways.json {} | AirwayLegs.json {}",
-            format_duration(airway_reference_load_timing.mirror_reference),
-            format_duration(airway_reference_load_timing.airways_json),
-            format_duration(airway_reference_load_timing.airway_legs_json),
-        );
-        println!(
-            "  Per-target pre-export sum: detect TerminalID {} | prepare output {}",
-            format_duration(detect_start_terminal_total),
-            format_duration(prepare_output_total),
-        );
-        println!(
-            "  Export wall (all targets): {}",
-            format_duration(export_total)
-        );
-        println!("  Total elapsed: {}", format_duration(total_elapsed));
-    } else {
-        println!("Total elapsed: {}", format_duration(total_start.elapsed()));
-    }
+    println!("Total elapsed: {}", format_duration(total_start.elapsed()));
 
     Ok(())
 }
@@ -336,7 +281,7 @@ fn start_output_prewarm(
 ) -> thread::JoinHandle<Result<HashMap<PathBuf, OutputPrewarmResult>>> {
     let output_targets = config.output_targets.clone();
     let start_terminal_id = config.start_terminal_id;
-    let can_detect_start_terminal = !config.debug;
+    let can_detect_start_terminal = true;
 
     thread::spawn(move || {
         prewarm_output_targets(
@@ -362,17 +307,9 @@ fn start_airway_reference_json_prewarm(
     let mut reference_dirs = Vec::new();
     let mut seen_dirs = HashSet::new();
 
-    if config.debug {
-        if let Some(reference_dir) = config.reference_dir.clone() {
-            if seen_dirs.insert(reference_dir.clone()) {
-                reference_dirs.push(reference_dir);
-            }
-        }
-    } else {
-        for output in &config.output_targets {
-            if seen_dirs.insert(output.path.clone()) {
-                reference_dirs.push(output.path.clone());
-            }
+    for output in &config.output_targets {
+        if seen_dirs.insert(output.path.clone()) {
+            reference_dirs.push(output.path.clone());
         }
     }
 
@@ -391,10 +328,6 @@ fn join_airway_reference_json_prewarm(
 fn start_table_index_prewarm(
     config: &config::AppConfig,
 ) -> thread::JoinHandle<Result<HashMap<PathBuf, PreloadedTableIndicesByName>>> {
-    if config.debug {
-        return thread::spawn(|| Ok(HashMap::new()));
-    }
-
     let output_paths: Vec<PathBuf> = config
         .output_targets
         .iter()
@@ -432,30 +365,22 @@ fn prewarm_output_targets(
     can_detect_start_terminal: bool,
 ) -> Result<HashMap<PathBuf, OutputPrewarmResult>> {
     let prewarm_one = |output: &OutputLocation| -> Result<(PathBuf, OutputPrewarmResult)> {
-        let prepare_output_start = Instant::now();
         prepare_output_directory(&output.path)?;
-        let prepare_output_time = prepare_output_start.elapsed();
 
-        let (start_terminal_id, detect_start_terminal_time) = if can_detect_start_terminal {
-            let detect_start_terminal_start = Instant::now();
+        let start_terminal_id = if can_detect_start_terminal {
             let start_terminal_id = match start_terminal_id {
                 Some(value) => value,
                 None => detect_start_terminal_id(&output.path)?,
             };
-            (
-                Some(start_terminal_id),
-                detect_start_terminal_start.elapsed(),
-            )
+            Some(start_terminal_id)
         } else {
-            (start_terminal_id, Duration::default())
+            start_terminal_id
         };
 
         Ok((
             output.path.clone(),
             OutputPrewarmResult {
                 start_terminal_id,
-                detect_start_terminal_time,
-                prepare_output_time,
             },
         ))
     };
@@ -554,11 +479,11 @@ fn resolve_input_paths(
     };
     let rte_seg_prewarm_handle = start_rte_seg_prewarm(rte_seg_path.clone());
 
-    let (db_path, db_validated_during_prompt, non_debug_total_start) = match &config.db_path {
-        Some(path) => (path.clone(), false, None),
+    let (db_path, db_validated_during_prompt) = match &config.db_path {
+        Some(path) => (path.clone(), false),
         None => {
-            let (path, prompt_result) = prompt_db3_path()?;
-            (path, true, Some(prompt_result.total_elapsed_start))
+            let path = prompt_db3_path()?;
+            (path, true)
         }
     };
 
@@ -567,7 +492,6 @@ fn resolve_input_paths(
             rte_seg_path,
             db_path,
             db_validated_during_prompt,
-            non_debug_total_start,
         },
         rte_seg_prewarm_handle,
     ))
@@ -593,22 +517,7 @@ fn prepare_and_load_shared_airway_reference(
     preloaded_rte_seg: &PreloadedRteSegData,
     preloaded_reference_json: Option<PreloadedAirwayReferenceJson>,
 ) -> Result<SharedAirwayReferenceContext> {
-    let mut seed_copy_time = Duration::default();
-    let runtime_reference_dir = if config.debug {
-        if let (Some(reference_dir), Some(output_target)) = (
-            config.reference_dir.as_deref(),
-            config.output_targets.first(),
-        ) {
-            let seed_start = Instant::now();
-            prepare_debug_output_from_reference(reference_dir, &output_target.path)?;
-            seed_copy_time = seed_start.elapsed();
-            Some(output_target.path.clone())
-        } else {
-            config.reference_dir.clone()
-        }
-    } else {
-        config.reference_dir.clone()
-    };
+    let runtime_reference_dir = config.reference_dir.clone();
 
     let load_airway_reference_start = Instant::now();
     let (airway_reference, load_timing) = load_airway_reference(
@@ -624,39 +533,30 @@ fn prepare_and_load_shared_airway_reference(
         airway_reference,
         load_timing,
         load_time,
-        seed_copy_time,
     })
 }
 
-fn execute_output_target(
-    output: OutputLocation,
-    prewarmed: Option<&OutputPrewarmResult>,
-    db_path: &Path,
-    rte_seg_path: &Path,
-    preloaded_rte_seg: &PreloadedRteSegData,
-    preloaded_waypoint_candidates: &PreloadedWaypointCandidates,
-    preloaded_reference_json: Option<PreloadedAirwayReferenceJson>,
-    preloaded_existing_indices: Option<PreloadedTableIndicesByName>,
-    reference_source: AirwayReferenceSource<'_>,
-) -> Result<OutputExecutionResult> {
-    let (start_terminal_id, detect_start_terminal_time) = if let Some(prewarmed) = prewarmed {
+fn execute_output_target(params: ExecuteOutputTargetParams<'_>) -> Result<OutputExecutionResult> {
+    let ExecuteOutputTargetParams {
+        output,
+        prewarmed,
+        db_path,
+        rte_seg_path,
+        preloaded_rte_seg,
+        preloaded_waypoint_candidates,
+        preloaded_reference_json,
+        preloaded_existing_indices,
+        reference_source,
+    } = params;
+
+    let start_terminal_id = if let Some(prewarmed) = prewarmed {
         match prewarmed.start_terminal_id {
-            Some(start_terminal_id) => (start_terminal_id, prewarmed.detect_start_terminal_time),
-            None => {
-                let detect_start_terminal_start = Instant::now();
-                let start_terminal_id = detect_start_terminal_id(&output.path)?;
-                (start_terminal_id, detect_start_terminal_start.elapsed())
-            }
+            Some(start_terminal_id) => start_terminal_id,
+            None => detect_start_terminal_id(&output.path)?,
         }
     } else {
-        let detect_start_terminal_start = Instant::now();
-        let start_terminal_id = detect_start_terminal_id(&output.path)?;
-        (start_terminal_id, detect_start_terminal_start.elapsed())
+        detect_start_terminal_id(&output.path)?
     };
-
-    let prepare_output_time = prewarmed
-        .map(|result| result.prepare_output_time)
-        .unwrap_or_default();
 
     let (base_json_dir, airway_reference) = match reference_source {
         AirwayReferenceSource::Shared {
@@ -670,57 +570,53 @@ fn execute_output_target(
                 Some(preloaded_rte_seg),
                 preloaded_reference_json,
             )?;
-            let export_stats = export_db3_to_json(
+            let _ = export_db3_to_json(ExportDb3ToJsonParams {
                 db_path,
                 start_terminal_id,
-                &output.path,
-                Some(&output.path),
-                &airway_reference,
+                output_dir: &output.path,
+                base_json_dir: Some(&output.path),
+                airway_reference: &airway_reference,
                 rte_seg_path,
                 preloaded_rte_seg,
                 preloaded_waypoint_candidates,
                 preloaded_existing_indices,
-            )?;
+            })?;
             return Ok(OutputExecutionResult {
                 output,
-                detect_start_terminal_time,
-                prepare_output_time,
-                export_stats,
             });
         }
     };
 
-    let export_stats = export_db3_to_json(
+    let _ = export_db3_to_json(ExportDb3ToJsonParams {
         db_path,
         start_terminal_id,
-        &output.path,
+        output_dir: &output.path,
         base_json_dir,
         airway_reference,
         rte_seg_path,
         preloaded_rte_seg,
         preloaded_waypoint_candidates,
         preloaded_existing_indices,
-    )?;
+    })?;
 
     Ok(OutputExecutionResult {
         output,
-        detect_start_terminal_time,
-        prepare_output_time,
-        export_stats,
     })
 }
 
-fn export_db3_to_json(
-    db_path: &Path,
-    start_terminal_id: i64,
-    output_dir: &Path,
-    base_json_dir: Option<&Path>,
-    airway_reference: &airways::AirwayReferenceData,
-    rte_seg_path: &Path,
-    preloaded_rte_seg: &PreloadedRteSegData,
-    preloaded_waypoint_candidates: &PreloadedWaypointCandidates,
-    preloaded_existing_indices: Option<PreloadedTableIndicesByName>,
-) -> Result<ExportStats> {
+fn export_db3_to_json(params: ExportDb3ToJsonParams<'_>) -> Result<ExportStats> {
+    let ExportDb3ToJsonParams {
+        db_path,
+        start_terminal_id,
+        output_dir,
+        base_json_dir,
+        airway_reference,
+        rte_seg_path,
+        preloaded_rte_seg,
+        preloaded_waypoint_candidates,
+        preloaded_existing_indices,
+    } = params;
+
     let export_start = Instant::now();
     let waypoint_read_time = Duration::default();
     let waypoint_count = 0usize;
@@ -785,89 +681,6 @@ fn export_db3_to_json(
         terminal_leg_wall,
         total_elapsed: export_start.elapsed(),
     })
-}
-
-fn print_export_stats(stats: &ExportStats) {
-    let mut aggregate = PhaseDurations::default();
-    for table in &stats.table_stats {
-        aggregate.add_assign(&table.phase);
-    }
-    aggregate.add_assign(&stats.terminal_leg_stats.phase);
-
-    println!("\nExport timing:");
-    println!(
-        "  Total: {} | Waypoint index: {} rows",
-        format_duration(stats.total_elapsed),
-        stats.waypoint_count
-    );
-    println!(
-        "  Wall clock: Waypoints {} | Base tables {} | ProcedureLegs {}",
-        format_duration(stats.waypoint_index_wall),
-        format_duration(stats.table_export_wall),
-        format_duration(stats.terminal_leg_wall)
-    );
-    println!(
-        "  Task sum: DB {} | JSON build {} | JSON write {} | Total {}",
-        format_duration(aggregate.db_read),
-        format_duration(aggregate.json_transform),
-        format_duration(aggregate.json_write),
-        format_duration(aggregate.total())
-    );
-    println!("  Tables:");
-    for table in &stats.table_stats {
-        println!(
-            "    {:<15} rows {:>7} | DB {} | JSON build {} | JSON write {} | Total {}",
-            table.table_name,
-            table.row_count,
-            format_duration(table.phase.db_read),
-            format_duration(table.phase.json_transform),
-            format_duration(table.phase.json_write),
-            format_duration(table.phase.total())
-        );
-    }
-    println!(
-        "  ProcedureLegs: rows {} | files {} | DB {} | JSON build {} | JSON write {} | Total {}",
-        stats.terminal_leg_stats.row_count,
-        stats.terminal_leg_stats.file_count,
-        format_duration(stats.terminal_leg_stats.phase.db_read),
-        format_duration(stats.terminal_leg_stats.phase.json_transform),
-        format_duration(stats.terminal_leg_stats.phase.json_write),
-        format_duration(stats.terminal_leg_stats.phase.total())
-    );
-
-    println!(
-        "  ProcedureLegs detail: legs-query {} | terminal-meta {} | runway-coords {} | waypoint-coords {} | group {} | cleanup {}",
-        format_duration(stats.terminal_leg_stats.detail.db_terminal_legs),
-        format_duration(stats.terminal_leg_stats.detail.db_terminal_metadata),
-        format_duration(stats.terminal_leg_stats.detail.db_runway_coords),
-        format_duration(stats.terminal_leg_stats.detail.db_waypoint_coords),
-        format_duration(stats.terminal_leg_stats.detail.group_rows),
-        format_duration(stats.terminal_leg_stats.detail.cleanup_files),
-    );
-
-    println!(
-        "  Airways detail: waypoint-candidates {} | rte-seg-build {} | merge {} | write-airways {} | write-airwaylegs {}",
-        format_duration(stats.airway_detail.waypoint_candidates_load),
-        format_duration(stats.airway_detail.build_from_rte_seg),
-        format_duration(stats.airway_detail.merge_outputs),
-        format_duration(stats.airway_detail.write_airways),
-        format_duration(stats.airway_detail.write_airway_legs),
-    );
-
-    println!("  Table detail:");
-    for table in &stats.table_stats {
-        if let Some(detail) = &table.detail {
-            println!(
-                "    {:<15} source {:>7} -> formatted {:>7} | existing-load {} | format {} | merge {}",
-                table.table_name,
-                detail.source_rows,
-                detail.formatted_rows,
-                format_duration(detail.existing_load),
-                format_duration(detail.format_rows),
-                format_duration(detail.merge_rows),
-            );
-        }
-    }
 }
 
 fn format_duration(duration: Duration) -> String {

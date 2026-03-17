@@ -2,9 +2,8 @@ use std::collections::HashSet;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
@@ -35,36 +34,9 @@ const REQUIRED_TABLES: &[&str] = &[
     "Waypoints",
 ];
 
-const DEBUG_DB_PATH: &str = r"c:\ProgramData\Fenix\Navdata\nd.db3";
-const DEBUG_RTE_SEG_PATH: &str = r"D:\yyz\Documents\NAIP\RTE_SEG.csv";
-const DEBUG_WORKSPACE_DIR: &str = r"Nav-Primary_debug\workspace";
-const DEBUG_SAMPLE_DIR: &str = r"Nav-Primary_debug\sample";
-const DEBUG_START_TERMINAL_ID: i64 = 96_701;
-const DEBUG_SEED_FILES: &[&str] = &[
-    "AirportLookup.json",
-    "Airports.json",
-    "AirwayLegs.json",
-    "Airways.json",
-    "Config.json",
-    "cycle.json",
-    "cycle_info.txt",
-    "Ilses.json",
-    "NavaidLookup.json",
-    "Navaids.json",
-    "NavaidTypes.json",
-    "Runways.json",
-    "SurfaceTypes.json",
-    "Terminals.json",
-    "TrmLegTypes.json",
-    "WaypointLookup.json",
-    "Waypoints.json",
-];
-
 #[derive(Clone, Debug)]
 pub(crate) struct AppConfig {
-    pub(crate) debug: bool,
     pub(crate) output_targets: Vec<OutputLocation>,
-    pub(crate) output_label: String,
     pub(crate) reference_dir: Option<PathBuf>,
     pub(crate) db_path: Option<PathBuf>,
     pub(crate) start_terminal_id: Option<i64>,
@@ -77,60 +49,18 @@ pub(crate) struct OutputLocation {
     pub(crate) path: PathBuf,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct PromptDb3PathResult {
-    pub(crate) total_elapsed_start: Instant,
-}
-
 pub(crate) fn parse_args() -> Result<AppConfig> {
     let args: Vec<String> = env::args().skip(1).collect();
-    let debug = args.iter().any(|arg| arg == "--DEBUG");
-    let invalid_args: Vec<&str> = args
-        .iter()
-        .filter(|arg| arg.as_str() != "--DEBUG")
-        .map(String::as_str)
-        .collect();
-    if !invalid_args.is_empty() {
-        bail!("unsupported arguments: {}", invalid_args.join(" "));
-    }
-
-    if debug {
-        let candidates = detect_output_directories();
-        let selected = select_output_locations(&candidates)?;
-        let output_label = if selected.len() == 1 {
-            format!("{} reference", selected[0].label)
-        } else {
-            format!("{} references", selected.len())
-        };
-        let reference_dir = selected.first().map(|location| location.path.clone());
-
-        return Ok(AppConfig {
-            debug: true,
-            output_targets: vec![OutputLocation {
-                label: "DEBUG workspace".to_string(),
-                path: PathBuf::from(DEBUG_WORKSPACE_DIR),
-            }],
-            output_label,
-            reference_dir,
-            db_path: Some(PathBuf::from(DEBUG_DB_PATH)),
-            start_terminal_id: None,
-            rte_seg_path: Some(PathBuf::from(DEBUG_RTE_SEG_PATH)),
-        });
+    if !args.is_empty() {
+        bail!("unsupported arguments: {}", args.join(" "));
     }
 
     let candidates = detect_output_directories();
     let selected = select_output_locations(&candidates)?;
-    let output_label = if selected.len() == 1 {
-        selected[0].label.clone()
-    } else {
-        format!("{} locations", selected.len())
-    };
     let reference_dir = selected.first().map(|location| location.path.clone());
 
     Ok(AppConfig {
-        debug: false,
         output_targets: selected,
-        output_label,
         reference_dir,
         db_path: None,
         start_terminal_id: None,
@@ -154,18 +84,9 @@ pub(crate) fn prepare_output_directory(output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn prepare_debug_output_from_reference(
-    reference_dir: &Path,
-    output_dir: &Path,
-) -> Result<()> {
-    sync_debug_seed_files(reference_dir, output_dir)?;
-    remove_workspace_procedure_legs_from(output_dir, DEBUG_START_TERMINAL_ID)
-}
-
-pub(crate) fn prompt_db3_path() -> Result<(PathBuf, PromptDb3PathResult)> {
+pub(crate) fn prompt_db3_path() -> Result<PathBuf> {
     loop {
         let input = prompt("Enter Fenix nd.db3 path: ")?;
-        let total_elapsed_start = Instant::now();
         let trimmed = input.trim().trim_matches(['\'', '"']);
         let path = PathBuf::from(trimmed);
         if !path.exists() || path.extension().and_then(|ext| ext.to_str()) != Some("db3") {
@@ -182,14 +103,7 @@ pub(crate) fn prompt_db3_path() -> Result<(PathBuf, PromptDb3PathResult)> {
         };
 
         match validate_required_tables(&validation_conn) {
-            Ok(()) => {
-                return Ok((
-                    path,
-                    PromptDb3PathResult {
-                        total_elapsed_start,
-                    },
-                ));
-            }
+            Ok(()) => return Ok(path),
             Err(_) => println!("This file is not a valid Fenix nav database. Please try again."),
         }
     }
@@ -268,166 +182,6 @@ pub(crate) fn validate_required_tables(conn: &Connection) -> Result<()> {
     } else {
         bail!("missing required tables: {}", missing.join(", "));
     }
-}
-
-pub(crate) fn debug_sample_dir() -> &'static Path {
-    Path::new(DEBUG_SAMPLE_DIR)
-}
-
-fn sync_debug_seed_files(reference_dir: &Path, output_dir: &Path) -> Result<()> {
-    fs::create_dir_all(output_dir).with_context(|| {
-        format!(
-            "failed to create debug workspace directory: {}",
-            output_dir.display()
-        )
-    })?;
-
-    for file_name in DEBUG_SEED_FILES {
-        let source_path = reference_dir.join(file_name);
-        let target_path = output_dir.join(file_name);
-        if !source_path.exists() {
-            bail!(
-                "required debug seed file is missing from reference: {}",
-                source_path.display()
-            );
-        }
-        sync_file_if_different(&source_path, &target_path)?;
-    }
-
-    Ok(())
-}
-
-fn sync_file_if_different(source_path: &Path, target_path: &Path) -> Result<()> {
-    if target_path.exists() && files_match(source_path, target_path)? {
-        return Ok(());
-    }
-    copy_file_contents(source_path, target_path)
-}
-
-fn files_match(left_path: &Path, right_path: &Path) -> Result<bool> {
-    let left_meta = fs::metadata(left_path)
-        .with_context(|| format!("failed to read file metadata: {}", left_path.display()))?;
-    let right_meta = fs::metadata(right_path)
-        .with_context(|| format!("failed to read file metadata: {}", right_path.display()))?;
-    if left_meta.len() != right_meta.len() {
-        return Ok(false);
-    }
-
-    let left = fs::File::open(left_path).with_context(|| {
-        format!(
-            "failed to open file for seed compare: {}",
-            left_path.display()
-        )
-    })?;
-    let right = fs::File::open(right_path).with_context(|| {
-        format!(
-            "failed to open file for seed compare: {}",
-            right_path.display()
-        )
-    })?;
-    let mut left_reader = BufReader::with_capacity(1024 * 1024, left);
-    let mut right_reader = BufReader::with_capacity(1024 * 1024, right);
-    let mut left_buf = [0u8; 64 * 1024];
-    let mut right_buf = [0u8; 64 * 1024];
-
-    loop {
-        let left_len = io::Read::read(&mut left_reader, &mut left_buf).with_context(|| {
-            format!(
-                "failed to read file for seed compare: {}",
-                left_path.display()
-            )
-        })?;
-        let right_len = io::Read::read(&mut right_reader, &mut right_buf).with_context(|| {
-            format!(
-                "failed to read file for seed compare: {}",
-                right_path.display()
-            )
-        })?;
-        if left_len != right_len {
-            return Ok(false);
-        }
-        if left_len == 0 {
-            return Ok(true);
-        }
-        if left_buf[..left_len] != right_buf[..right_len] {
-            return Ok(false);
-        }
-    }
-}
-
-fn copy_file_contents(source_path: &Path, target_path: &Path) -> Result<()> {
-    let source = fs::File::open(source_path).with_context(|| {
-        format!(
-            "failed to open source file for debug copy: {}",
-            source_path.display()
-        )
-    })?;
-    let target = fs::File::create(target_path).with_context(|| {
-        format!(
-            "failed to create target file for debug copy: {}",
-            target_path.display()
-        )
-    })?;
-    let mut reader = BufReader::with_capacity(1024 * 1024, source);
-    let mut writer = BufWriter::with_capacity(1024 * 1024, target);
-    io::copy(&mut reader, &mut writer).with_context(|| {
-        format!(
-            "failed to copy debug seed file from {} to {}",
-            source_path.display(),
-            target_path.display()
-        )
-    })?;
-    writer.flush().with_context(|| {
-        format!(
-            "failed to flush copied debug seed file: {}",
-            target_path.display()
-        )
-    })?;
-    Ok(())
-}
-
-fn remove_workspace_procedure_legs_from(output_dir: &Path, min_terminal_id: i64) -> Result<()> {
-    let procedure_dir = output_dir.join("ProcedureLegs");
-    if !procedure_dir.exists() {
-        return Ok(());
-    }
-
-    for entry in fs::read_dir(&procedure_dir).with_context(|| {
-        format!(
-            "failed to read workspace ProcedureLegs directory: {}",
-            procedure_dir.display()
-        )
-    })? {
-        let entry = entry.with_context(|| {
-            format!(
-                "failed to read workspace ProcedureLegs entry: {}",
-                procedure_dir.display()
-            )
-        })?;
-        let file_name = match entry.file_name().into_string() {
-            Ok(name) => name,
-            Err(_) => continue,
-        };
-        let Some(number_text) = file_name
-            .strip_prefix("TermID_")
-            .and_then(|value| value.strip_suffix(".json"))
-        else {
-            continue;
-        };
-        let Ok(terminal_id) = number_text.parse::<i64>() else {
-            continue;
-        };
-        if terminal_id >= min_terminal_id {
-            fs::remove_file(entry.path()).with_context(|| {
-                format!(
-                    "failed to remove seeded ProcedureLegs file: {}",
-                    entry.path().display()
-                )
-            })?;
-        }
-    }
-
-    Ok(())
 }
 
 fn detect_output_directories() -> Vec<OutputLocation> {

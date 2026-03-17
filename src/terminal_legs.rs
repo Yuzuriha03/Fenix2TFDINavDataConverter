@@ -450,7 +450,7 @@ impl Iterator for TerminalJobIter<'_> {
         let terminal_id = first.terminal_id;
         let mut group = vec![first];
 
-        while let Some(mut leg) = self.legs.next() {
+        for mut leg in self.legs.by_ref() {
             if leg.terminal_id != terminal_id {
                 self.buffered = Some(leg);
                 break;

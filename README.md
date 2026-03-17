@@ -42,6 +42,3 @@ The following locations will be checked in order:
 
 Before writing `AirwayLegs.json`, the program will first read the existing `Airways.json` and `AirwayLegs.json` in the target directory, and determine which segments need reverse records based on the current airway mirroring mode.
 在写入 `AirwayLegs.json` 前，程序会先读取目标目录现有的 `Airways.json` 和 `AirwayLegs.json`，按现有航路镜像模式决定哪些航段需要补写反向记录。
-
-In `--DEBUG` mode, output will still be written to `Nav-Primary_debug/<timestamp>` in the repository, but if an installed `Nav-Primary` is detected, its `Airways.json` and `AirwayLegs.json` will also be used as reference direction templates.
-`--DEBUG` 模式仍然输出到仓库内的 `Nav-Primary_debug/<timestamp>`，但如果检测到已安装的 `Nav-Primary`，也会使用其 `Airways.json` 和 `AirwayLegs.json` 作为参考方向模板。
