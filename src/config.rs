@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
@@ -74,6 +75,11 @@ pub(crate) struct AppConfig {
 pub(crate) struct OutputLocation {
     pub(crate) label: String,
     pub(crate) path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PromptDb3PathResult {
+    pub(crate) total_elapsed_start: Instant,
 }
 
 pub(crate) fn parse_args() -> Result<AppConfig> {
@@ -156,9 +162,10 @@ pub(crate) fn prepare_debug_output_from_reference(
     remove_workspace_procedure_legs_from(output_dir, DEBUG_START_TERMINAL_ID)
 }
 
-pub(crate) fn prompt_db3_path() -> Result<PathBuf> {
+pub(crate) fn prompt_db3_path() -> Result<(PathBuf, PromptDb3PathResult)> {
     loop {
         let input = prompt("Enter Fenix nd.db3 path: ")?;
+        let total_elapsed_start = Instant::now();
         let trimmed = input.trim().trim_matches(['\'', '"']);
         let path = PathBuf::from(trimmed);
         if !path.exists() || path.extension().and_then(|ext| ext.to_str()) != Some("db3") {
@@ -175,7 +182,14 @@ pub(crate) fn prompt_db3_path() -> Result<PathBuf> {
         };
 
         match validate_required_tables(&validation_conn) {
-            Ok(()) => return Ok(path),
+            Ok(()) => {
+                return Ok((
+                    path,
+                    PromptDb3PathResult {
+                        total_elapsed_start,
+                    },
+                ));
+            }
             Err(_) => println!("This file is not a valid Fenix nav database. Please try again."),
         }
     }
@@ -299,10 +313,18 @@ fn files_match(left_path: &Path, right_path: &Path) -> Result<bool> {
         return Ok(false);
     }
 
-    let left = fs::File::open(left_path)
-        .with_context(|| format!("failed to open file for seed compare: {}", left_path.display()))?;
-    let right = fs::File::open(right_path)
-        .with_context(|| format!("failed to open file for seed compare: {}", right_path.display()))?;
+    let left = fs::File::open(left_path).with_context(|| {
+        format!(
+            "failed to open file for seed compare: {}",
+            left_path.display()
+        )
+    })?;
+    let right = fs::File::open(right_path).with_context(|| {
+        format!(
+            "failed to open file for seed compare: {}",
+            right_path.display()
+        )
+    })?;
     let mut left_reader = BufReader::with_capacity(1024 * 1024, left);
     let mut right_reader = BufReader::with_capacity(1024 * 1024, right);
     let mut left_buf = [0u8; 64 * 1024];
@@ -310,10 +332,16 @@ fn files_match(left_path: &Path, right_path: &Path) -> Result<bool> {
 
     loop {
         let left_len = io::Read::read(&mut left_reader, &mut left_buf).with_context(|| {
-            format!("failed to read file for seed compare: {}", left_path.display())
+            format!(
+                "failed to read file for seed compare: {}",
+                left_path.display()
+            )
         })?;
         let right_len = io::Read::read(&mut right_reader, &mut right_buf).with_context(|| {
-            format!("failed to read file for seed compare: {}", right_path.display())
+            format!(
+                "failed to read file for seed compare: {}",
+                right_path.display()
+            )
         })?;
         if left_len != right_len {
             return Ok(false);

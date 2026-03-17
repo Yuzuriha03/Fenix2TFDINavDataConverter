@@ -16,6 +16,13 @@ use super::{AirwayMirrorReference, directed_airway_route_key};
 type AirwayRows = Vec<Map<String, Value>>;
 type AirwayBuildOutput = (AirwayRows, AirwayRows);
 
+#[derive(Clone, Debug)]
+pub(crate) struct PreloadedRteSegData {
+    pub(super) mirror_reference: AirwayMirrorReference,
+    pub(super) airway_rows: Vec<ParsedRteSegAirwayRow>,
+    pub(super) required_waypoint_idents: HashSet<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RteSegDirection {
     Bidirectional,
@@ -48,7 +55,7 @@ pub(super) struct ParsedRteSegAirwayRow {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct WaypointCandidate {
+pub(crate) struct WaypointCandidate {
     id: i64,
     latitude: f64,
     longitude: f64,
@@ -233,6 +240,22 @@ pub(super) fn build_airway_tables_from_rows(
 pub(super) fn load_rte_seg_mirror_reference(rte_seg_path: &Path) -> Result<AirwayMirrorReference> {
     let content = read_text_gbk(rte_seg_path)?;
     load_rte_seg_mirror_reference_from_bufread(Cursor::new(content))
+}
+
+pub(crate) fn preload_rte_seg(rte_seg_path: &Path) -> Result<PreloadedRteSegData> {
+    let content = read_text_gbk(rte_seg_path)?;
+    let (mirror_reference, airway_rows) = rayon::join(
+        || load_rte_seg_mirror_reference_from_bufread(Cursor::new(content.as_bytes())),
+        || parse_rte_seg_airway_rows_from_bufread(Cursor::new(content.as_bytes())),
+    );
+    let airway_rows = airway_rows?;
+    let required_waypoint_idents = collect_required_waypoint_idents(&airway_rows);
+
+    Ok(PreloadedRteSegData {
+        mirror_reference: mirror_reference?,
+        airway_rows,
+        required_waypoint_idents,
+    })
 }
 
 fn normalize_rte_seg_airway_row(

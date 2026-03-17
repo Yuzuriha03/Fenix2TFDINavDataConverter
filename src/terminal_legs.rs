@@ -1,12 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use rusqlite::{Connection, params, params_from_iter};
-use serde_json::{Map, Number, Value};
+use serde::ser::{Serialize, SerializeStruct, Serializer};
+use serde_json::{Number, Value};
 
 use crate::db_json::{
     configure_read_connection, json_to_i64, sql_value_to_json,
@@ -149,60 +151,103 @@ impl TerminalLegRecord {
     fn vnav(&self) -> Option<f64> {
         self.vnav_num
     }
+}
 
-    fn to_output_map(&self) -> Map<String, Value> {
-        let mut ordered = Map::with_capacity(25);
-        ordered.insert("ID".to_string(), Value::Number(Number::from(self.id)));
-        ordered.insert(
-            "TerminalID".to_string(),
-            Value::Number(Number::from(self.terminal_id)),
-        );
-        ordered.insert("Type".to_string(), self.leg_type.clone());
-        ordered.insert(
-            "Transition".to_string(),
-            normalize_leg_text(&self.transition),
-        );
-        ordered.insert("TrackCode".to_string(), self.track_code.clone());
-        ordered.insert("WptID".to_string(), self.wpt_id.clone());
-        ordered.insert("WptLat".to_string(), self.wpt_lat.clone());
-        ordered.insert("WptLon".to_string(), self.wpt_lon.clone());
-        ordered.insert("TurnDir".to_string(), normalize_leg_text(&self.turn_dir));
-        ordered.insert("NavID".to_string(), self.nav_id.clone());
-        ordered.insert("NavLat".to_string(), self.nav_lat.clone());
-        ordered.insert("NavLon".to_string(), self.nav_lon.clone());
-        ordered.insert("NavBear".to_string(), self.nav_bear.clone());
-        ordered.insert("NavDist".to_string(), self.nav_dist.clone());
-        ordered.insert("Course".to_string(), self.course.clone());
-        ordered.insert("Distance".to_string(), self.distance.clone());
-        ordered.insert("Alt".to_string(), normalize_leg_text(&self.alt));
-        ordered.insert("Vnav".to_string(), self.vnav.clone());
-        ordered.insert("CenterID".to_string(), self.center_id.clone());
-        ordered.insert("CenterLat".to_string(), self.center_lat.clone());
-        ordered.insert("CenterLon".to_string(), self.center_lon.clone());
-        ordered.insert(
-            "IsFlyOver".to_string(),
-            if self.is_fly_over_num == Some(1) {
-                Value::Number(Number::from(-1))
-            } else {
-                self.is_fly_over.clone()
+impl Serialize for TerminalLegRecord {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("TerminalLegRecord", 25)?;
+        state.serialize_field("ID", &self.id)?;
+        state.serialize_field("TerminalID", &self.terminal_id)?;
+        state.serialize_field("Type", &self.leg_type)?;
+        state.serialize_field("Transition", &TextOrEmpty(&self.transition))?;
+        state.serialize_field("TrackCode", &self.track_code)?;
+        state.serialize_field("WptID", &self.wpt_id)?;
+        state.serialize_field("WptLat", &self.wpt_lat)?;
+        state.serialize_field("WptLon", &self.wpt_lon)?;
+        state.serialize_field("TurnDir", &TextOrEmpty(&self.turn_dir))?;
+        state.serialize_field("NavID", &self.nav_id)?;
+        state.serialize_field("NavLat", &self.nav_lat)?;
+        state.serialize_field("NavLon", &self.nav_lon)?;
+        state.serialize_field("NavBear", &self.nav_bear)?;
+        state.serialize_field("NavDist", &self.nav_dist)?;
+        state.serialize_field("Course", &self.course)?;
+        state.serialize_field("Distance", &self.distance)?;
+        state.serialize_field("Alt", &TextOrEmpty(&self.alt))?;
+        state.serialize_field("Vnav", &self.vnav)?;
+        state.serialize_field("CenterID", &self.center_id)?;
+        state.serialize_field("CenterLat", &self.center_lat)?;
+        state.serialize_field("CenterLon", &self.center_lon)?;
+        state.serialize_field(
+            "IsFlyOver",
+            &FlyOverOutput {
+                value: &self.is_fly_over,
+                numeric: self.is_fly_over_num,
             },
-        );
-        ordered.insert(
-            "SpeedLimit".to_string(),
-            self.speed_limit_num
-                .map(Number::from)
-                .map(Value::Number)
-                .unwrap_or_else(|| self.speed_limit.clone()),
-        );
-        ordered.insert(
-            "IsFAF".to_string(),
-            Value::Number(Number::from(self.is_faf)),
-        );
-        ordered.insert(
-            "IsMAP".to_string(),
-            Value::Number(Number::from(self.is_map)),
-        );
-        ordered
+        )?;
+        state.serialize_field(
+            "SpeedLimit",
+            &SpeedLimitOutput {
+                value: &self.speed_limit,
+                numeric: self.speed_limit_num,
+            },
+        )?;
+        state.serialize_field("IsFAF", &self.is_faf)?;
+        state.serialize_field("IsMAP", &self.is_map)?;
+        state.end()
+    }
+}
+
+struct TextOrEmpty<'a>(&'a Value);
+
+impl Serialize for TextOrEmpty<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.0.is_null() {
+            serializer.serialize_str("")
+        } else {
+            self.0.serialize(serializer)
+        }
+    }
+}
+
+struct FlyOverOutput<'a> {
+    value: &'a Value,
+    numeric: Option<i64>,
+}
+
+impl Serialize for FlyOverOutput<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.numeric == Some(1) {
+            serializer.serialize_i64(-1)
+        } else {
+            self.value.serialize(serializer)
+        }
+    }
+}
+
+struct SpeedLimitOutput<'a> {
+    value: &'a Value,
+    numeric: Option<i64>,
+}
+
+impl Serialize for SpeedLimitOutput<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if let Some(value) = self.numeric {
+            serializer.serialize_i64(value)
+        } else {
+            self.value.serialize(serializer)
+        }
     }
 }
 
@@ -211,8 +256,7 @@ pub(crate) fn export_terminal_legs(
     start_terminal_id: i64,
     output_dir: &Path,
 ) -> Result<TerminalLegExportStats> {
-    let cleanup_required =
-        procedure_dir_has_existing_files_from(output_dir, start_terminal_id)?;
+    let cleanup_required = procedure_dir_has_existing_files_from(output_dir, start_terminal_id)?;
     let files_may_already_exist = cleanup_required;
     let db_read_start = Instant::now();
     let (
@@ -266,45 +310,35 @@ pub(crate) fn export_terminal_legs(
     let db_read_time = db_read_start.elapsed();
     let row_count = terminal_legs.len();
 
-    let json_transform_start = Instant::now();
-    let mut terminal_groups: HashMap<i64, Vec<TerminalLegRecord>> = HashMap::new();
-    for mut leg in terminal_legs {
-        leg.fill_coordinates(&runway_ids_by_terminal, &runway_coords, &waypoint_coords);
-        terminal_groups
-            .entry(leg.terminal_id)
-            .or_default()
-            .push(leg);
-    }
-    let terminal_jobs: Vec<(i64, Vec<TerminalLegRecord>)> = terminal_groups.into_iter().collect();
-    let file_count = terminal_jobs.len();
-    let json_transform_time = json_transform_start.elapsed();
-    detail.group_rows = json_transform_time;
+    let json_transform_time = Default::default();
+    detail.group_rows = Default::default();
 
     let json_write_start = Instant::now();
-    terminal_jobs
-        .into_par_iter()
-        .try_for_each(|(terminal_id, mut legs)| {
-            mark_final_approach_fix(&mut legs);
-            let ordered_legs: Vec<Map<String, Value>> =
-                legs.iter().map(TerminalLegRecord::to_output_map).collect();
-            let output_path = output_dir
-                .join("ProcedureLegs")
-                .join(format!("TermID_{terminal_id}.json"));
-            if files_may_already_exist {
-                write_json_objects_if_changed_with_buffer(
-                    &output_path,
-                    &ordered_legs,
-                    PROCEDURE_LEG_JSON_BUFFER_CAPACITY,
-                )
-                .map(|_| ())
-            } else {
-                write_json_objects_with_buffer(
-                    &output_path,
-                    &ordered_legs,
-                    PROCEDURE_LEG_JSON_BUFFER_CAPACITY,
-                )
-            }
-        })?;
+    let file_count = AtomicUsize::new(0);
+    TerminalJobIter::new(
+        terminal_legs,
+        &runway_ids_by_terminal,
+        &runway_coords,
+        &waypoint_coords,
+    )
+    .par_bridge()
+    .try_for_each(|(terminal_id, mut legs)| {
+        file_count.fetch_add(1, Ordering::Relaxed);
+        mark_final_approach_fix(&mut legs);
+        let output_path = output_dir
+            .join("ProcedureLegs")
+            .join(format!("TermID_{terminal_id}.json"));
+        if files_may_already_exist {
+            write_json_objects_if_changed_with_buffer(
+                &output_path,
+                &legs,
+                PROCEDURE_LEG_JSON_BUFFER_CAPACITY,
+            )
+            .map(|_| ())
+        } else {
+            write_json_objects_with_buffer(&output_path, &legs, PROCEDURE_LEG_JSON_BUFFER_CAPACITY)
+        }
+    })?;
 
     if let Some(terminal_ids) = terminal_ids_for_cleanup {
         let cleanup_start = Instant::now();
@@ -314,7 +348,7 @@ pub(crate) fn export_terminal_legs(
 
     Ok(TerminalLegExportStats {
         row_count,
-        file_count,
+        file_count: file_count.load(Ordering::Relaxed),
         phase: PhaseDurations {
             db_read: db_read_time,
             json_transform: json_transform_time,
@@ -337,7 +371,7 @@ fn fetch_terminal_legs(
 ) -> Result<Vec<TerminalLegRecord>> {
     let mut statement = conn
         .prepare(
-            "SELECT l.ID, l.TerminalID, l.Type, l.Transition, l.TrackCode, l.WptID, l.WptLat, l.WptLon, l.TurnDir, l.NavID, l.NavLat, l.NavLon, l.NavBear, l.NavDist, l.Course, l.Distance, l.Alt, l.Vnav, l.CenterID, l.CenterLat, l.CenterLon, ex.IsFlyOver, ex.SpeedLimit FROM TerminalLegs l LEFT JOIN TerminalLegsEx ex ON ex.ID = l.ID WHERE l.TerminalID >= ?",
+            "SELECT l.ID, l.TerminalID, l.Type, l.Transition, l.TrackCode, l.WptID, l.WptLat, l.WptLon, l.TurnDir, l.NavID, l.NavLat, l.NavLon, l.NavBear, l.NavDist, l.Course, l.Distance, l.Alt, l.Vnav, l.CenterID, l.CenterLat, l.CenterLon, ex.IsFlyOver, ex.SpeedLimit FROM TerminalLegs l LEFT JOIN TerminalLegsEx ex ON ex.ID = l.ID WHERE l.TerminalID >= ? ORDER BY l.TerminalID, l.ID",
         )
         .context("failed to query TerminalLegs")?;
     let rows = statement
@@ -376,6 +410,61 @@ fn fetch_all_terminal_ids(conn: &Connection) -> Result<HashSet<i64>> {
         .context("failed to iterate terminal ids")?;
     rows.collect::<rusqlite::Result<HashSet<_>>>()
         .context("failed to read terminal ids")
+}
+
+struct TerminalJobIter<'a> {
+    legs: std::vec::IntoIter<TerminalLegRecord>,
+    buffered: Option<TerminalLegRecord>,
+    runway_ids_by_terminal: &'a HashMap<i64, i64>,
+    runway_coords: &'a HashMap<i64, (f64, f64)>,
+    waypoint_coords: &'a HashMap<i64, (f64, f64)>,
+}
+
+impl<'a> TerminalJobIter<'a> {
+    fn new(
+        legs: Vec<TerminalLegRecord>,
+        runway_ids_by_terminal: &'a HashMap<i64, i64>,
+        runway_coords: &'a HashMap<i64, (f64, f64)>,
+        waypoint_coords: &'a HashMap<i64, (f64, f64)>,
+    ) -> Self {
+        Self {
+            legs: legs.into_iter(),
+            buffered: None,
+            runway_ids_by_terminal,
+            runway_coords,
+            waypoint_coords,
+        }
+    }
+}
+
+impl Iterator for TerminalJobIter<'_> {
+    type Item = (i64, Vec<TerminalLegRecord>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut first = self.buffered.take().or_else(|| self.legs.next())?;
+        first.fill_coordinates(
+            self.runway_ids_by_terminal,
+            self.runway_coords,
+            self.waypoint_coords,
+        );
+        let terminal_id = first.terminal_id;
+        let mut group = vec![first];
+
+        while let Some(mut leg) = self.legs.next() {
+            if leg.terminal_id != terminal_id {
+                self.buffered = Some(leg);
+                break;
+            }
+            leg.fill_coordinates(
+                self.runway_ids_by_terminal,
+                self.runway_coords,
+                self.waypoint_coords,
+            );
+            group.push(leg);
+        }
+
+        Some((terminal_id, group))
+    }
 }
 
 fn procedure_dir_has_existing_files_from(output_dir: &Path, min_terminal_id: i64) -> Result<bool> {
@@ -628,13 +717,5 @@ fn parse_vnav(value: Option<&Value>) -> Option<f64> {
             }
         }
         _ => None,
-    }
-}
-
-fn normalize_leg_text(value: &Value) -> Value {
-    if value.is_null() {
-        Value::String(String::new())
-    } else {
-        value.clone()
     }
 }

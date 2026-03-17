@@ -1,7 +1,7 @@
 target/
 dist/
 Nav-Primary*
-
+__pycache__
 # Local navigation database inputs
 *.db3
 

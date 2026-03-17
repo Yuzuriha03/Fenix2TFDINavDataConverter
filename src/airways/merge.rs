@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use rayon::prelude::*;
 use serde_json::{Map, Number, Value};
 
 use crate::db_json::json_to_i64;
@@ -8,6 +9,10 @@ use super::{AirwayLegReferenceRow, AirwayReferenceData, AirwayReferenceRow};
 
 type AirwayRows = Vec<Map<String, Value>>;
 type AirwayMergeOutput = (AirwayRows, AirwayRows);
+type SourceAirwayRowsByIdent<'a> = HashMap<String, &'a Map<String, Value>>;
+type SourceLegRowsByIdent<'a> = HashMap<String, Vec<&'a Map<String, Value>>>;
+type ReferenceAirwayRowsByIdent<'a> = HashMap<String, &'a AirwayReferenceRow>;
+type ReferenceLegRowsByIdent<'a> = HashMap<String, Vec<&'a AirwayLegReferenceRow>>;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct DirectedEdge {
@@ -31,10 +36,17 @@ struct SourceDirectionality {
 
 #[derive(Clone, Debug)]
 struct SegmentTemplate {
-    level: Value,
-    from_id: Value,
-    to_id: Value,
+    level: String,
+    from_id: Option<i64>,
+    to_id: Option<i64>,
     from_name: String,
+}
+
+#[derive(Debug)]
+struct IdentMergeResult {
+    ident: String,
+    airway_row: Map<String, Value>,
+    legs: AirwayRows,
 }
 
 #[derive(Clone, Debug)]
@@ -84,88 +96,88 @@ pub(super) fn merge_airway_outputs(
     let reference_ident_by_id = build_reference_airway_ident_map(&airway_reference.airways);
 
     let source_airway_by_ident = build_airway_row_map_by_ident(source_airways);
-    let mut final_airway_by_ident =
+    let reference_airway_by_ident =
         build_reference_airway_row_map_by_ident(&airway_reference.airways);
 
     let source_legs_by_ident = group_airway_legs_by_ident(source_legs, &source_ident_by_id);
-    let mut final_legs_by_ident =
+    let reference_legs_by_ident =
         group_reference_airway_legs_by_ident(&airway_reference.airway_legs, &reference_ident_by_id);
 
-    let mut next_airway_id = next_reference_airway_id(&airway_reference.airways);
-    let mut next_leg_id = airway_reference
-        .airway_legs
-        .iter()
-        .map(|row| row.id)
-        .max()
-        .unwrap_or(0)
-        + 1;
-
-    let mut source_idents: Vec<String> = source_airway_by_ident.keys().cloned().collect();
+    let mut source_idents: Vec<String> = source_legs_by_ident.keys().cloned().collect();
     source_idents.sort();
 
-    for ident in source_idents {
-        let source_legs_for_ident = source_legs_by_ident
-            .get(&ident)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        if source_legs_for_ident.is_empty() {
+    let mut final_idents: Vec<String> = reference_airway_by_ident.keys().cloned().collect();
+    final_idents.extend(source_idents.iter().cloned());
+    final_idents.sort();
+    final_idents.dedup();
+
+    let airway_id_by_ident = build_temp_airway_id_by_ident(&final_idents);
+
+    let average_legs_per_ident = source_legs.len() / source_idents.len().max(1);
+    let should_parallelize =
+        source_idents.len() >= rayon::current_num_threads() * 8 && average_legs_per_ident >= 32;
+
+    let merge_ident_range = |idents: &[String]| {
+        idents
+            .iter()
+            .filter_map(|ident| {
+                let airway_id = airway_id_by_ident
+                    .get(ident.as_str())
+                    .copied()
+                    .unwrap_or_default();
+                merge_ident(
+                    ident,
+                    airway_id,
+                    &source_airway_by_ident,
+                    &reference_airway_by_ident,
+                    &source_legs_by_ident,
+                    &reference_legs_by_ident,
+                    &airway_reference.mirror_reference,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let merged_results: Vec<IdentMergeResult> = if should_parallelize {
+        let chunk_size = (source_idents.len() / (rayon::current_num_threads() * 4)).clamp(64, 512);
+        source_idents
+            .par_chunks(chunk_size)
+            .map(merge_ident_range)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect()
+    } else {
+        merge_ident_range(&source_idents)
+    };
+
+    let mut merged_by_ident: HashMap<String, IdentMergeResult> = merged_results
+        .into_iter()
+        .map(|result| (result.ident.clone(), result))
+        .collect();
+
+    let mut final_airways = Vec::with_capacity(final_idents.len());
+    let mut final_legs = Vec::with_capacity(airway_reference.airway_legs.len() + source_legs.len());
+
+    for ident in final_idents {
+        let airway_id = airway_id_by_ident
+            .get(ident.as_str())
+            .copied()
+            .unwrap_or_default();
+
+        if let Some(result) = merged_by_ident.remove(ident.as_str()) {
+            final_airways.push(result.airway_row);
+            final_legs.extend(result.legs);
             continue;
         }
 
-        let source_chains = extract_chains(source_legs_for_ident);
-        let source_directionality = build_expected_directionality(
-            &ident,
-            source_legs_for_ident,
-            &airway_reference.mirror_reference,
-        );
-
-        let existing_legs = final_legs_by_ident
-            .get(&ident)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        let connected = has_connection(&source_chains, existing_legs);
-
-        let airway_row = ensure_airway_row(
-            &ident,
-            &source_airway_by_ident,
-            &mut final_airway_by_ident,
-            &mut next_airway_id,
-        );
-        let airway_id = json_to_i64(airway_row.get("ID")).unwrap_or(0);
-
-        let merged_legs = if connected {
-            merge_with_insertion_strategy(
-                &ident,
-                airway_id,
-                source_legs_for_ident,
-                existing_legs,
-                &source_chains,
-                &source_directionality,
-                &airway_reference.mirror_reference,
-                &mut next_leg_id,
-            )
-        } else {
-            build_independent_append(
-                &ident,
-                airway_id,
-                source_legs_for_ident,
-                &source_directionality,
-                airway_reference,
-                &mut next_leg_id,
-            )
+        let Some(reference_airway) = reference_airway_by_ident.get(ident.as_str()) else {
+            continue;
         };
 
-        final_legs_by_ident.insert(ident, merged_legs);
-    }
-
-    let mut final_airways: Vec<Map<String, Value>> = final_airway_by_ident.into_values().collect();
-    let mut final_legs = Vec::new();
-
-    let mut ordered_idents: Vec<String> = final_legs_by_ident.keys().cloned().collect();
-    ordered_idents.sort();
-    for ident in ordered_idents {
-        if let Some(rows) = final_legs_by_ident.remove(&ident) {
-            final_legs.extend(rows);
+        final_airways.push(reference_airway.to_map_with_id(airway_id));
+        if let Some(reference_legs) = reference_legs_by_ident.get(ident.as_str()) {
+            final_legs.extend(reference_legs_to_output_rows(reference_legs, airway_id));
         }
     }
 
@@ -173,31 +185,105 @@ pub(super) fn merge_airway_outputs(
     (final_airways, final_legs)
 }
 
-fn ensure_airway_row(
+fn merge_ident(
     ident: &str,
-    source_airway_by_ident: &HashMap<String, Map<String, Value>>,
-    final_airway_by_ident: &mut HashMap<String, Map<String, Value>>,
-    next_airway_id: &mut i64,
-) -> Map<String, Value> {
-    if let Some(existing) = final_airway_by_ident.get(ident).cloned() {
-        return existing;
+    airway_id: i64,
+    source_airway_by_ident: &SourceAirwayRowsByIdent<'_>,
+    reference_airway_by_ident: &ReferenceAirwayRowsByIdent<'_>,
+    source_legs_by_ident: &SourceLegRowsByIdent<'_>,
+    reference_legs_by_ident: &ReferenceLegRowsByIdent<'_>,
+    mirror_reference: &super::AirwayMirrorReference,
+) -> Option<IdentMergeResult> {
+    let source_legs_for_ident = source_legs_by_ident
+        .get(ident)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if source_legs_for_ident.is_empty() {
+        return None;
     }
 
-    let mut row = source_airway_by_ident
+    let source_chains = extract_chains(source_legs_for_ident);
+    let source_directionality =
+        build_expected_directionality(ident, source_legs_for_ident, mirror_reference);
+    let existing_legs = reference_legs_by_ident
         .get(ident)
-        .cloned()
-        .unwrap_or_else(|| {
-            let mut fallback = Map::new();
-            fallback.insert("Ident".to_string(), Value::String(ident.to_string()));
-            fallback
-        });
-    row.insert(
-        "ID".to_string(),
-        Value::Number(Number::from(*next_airway_id)),
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+
+    let airway_row = build_output_airway_row(
+        ident,
+        airway_id,
+        source_airway_by_ident,
+        reference_airway_by_ident,
     );
-    *next_airway_id += 1;
-    final_airway_by_ident.insert(ident.to_string(), row.clone());
-    row
+
+    let mut next_leg_id = 1;
+    let legs = if has_connection(&source_chains, existing_legs) {
+        merge_with_insertion_strategy(
+            ident,
+            airway_id,
+            source_legs_for_ident,
+            existing_legs,
+            &source_chains,
+            &source_directionality,
+            mirror_reference,
+            &mut next_leg_id,
+        )
+    } else {
+        build_independent_append(
+            ident,
+            airway_id,
+            source_legs_for_ident,
+            &source_directionality,
+            mirror_reference,
+            &mut next_leg_id,
+        )
+    };
+
+    Some(IdentMergeResult {
+        ident: ident.to_string(),
+        airway_row,
+        legs,
+    })
+}
+
+fn build_output_airway_row(
+    ident: &str,
+    airway_id: i64,
+    source_airway_by_ident: &SourceAirwayRowsByIdent<'_>,
+    reference_airway_by_ident: &ReferenceAirwayRowsByIdent<'_>,
+) -> Map<String, Value> {
+    if let Some(source_row) = source_airway_by_ident.get(ident) {
+        let mut row = (*source_row).clone();
+        row.insert("ID".to_string(), Value::Number(Number::from(airway_id)));
+        return row;
+    }
+
+    if let Some(reference_row) = reference_airway_by_ident.get(ident) {
+        return reference_row.to_map_with_id(airway_id);
+    }
+
+    let mut fallback = Map::with_capacity(2);
+    fallback.insert("ID".to_string(), Value::Number(Number::from(airway_id)));
+    fallback.insert("Ident".to_string(), Value::String(ident.to_string()));
+    fallback
+}
+
+fn build_temp_airway_id_by_ident(idents: &[String]) -> HashMap<String, i64> {
+    idents
+        .iter()
+        .enumerate()
+        .map(|(index, ident)| (ident.clone(), index as i64 + 1))
+        .collect()
+}
+
+fn reference_legs_to_output_rows(
+    rows: &[&AirwayLegReferenceRow],
+    airway_id: i64,
+) -> Vec<Map<String, Value>> {
+    rows.iter()
+        .map(|row| row.to_map_with_ids(row.id, airway_id))
+        .collect()
 }
 
 fn build_airway_ident_map(rows: &[Map<String, Value>]) -> HashMap<i64, String> {
@@ -214,34 +300,26 @@ fn build_reference_airway_ident_map(rows: &[AirwayReferenceRow]) -> HashMap<i64,
     rows.iter().map(|row| (row.id, row.ident.clone())).collect()
 }
 
-fn build_airway_row_map_by_ident(
-    rows: &[Map<String, Value>],
-) -> HashMap<String, Map<String, Value>> {
+fn build_airway_row_map_by_ident(rows: &[Map<String, Value>]) -> SourceAirwayRowsByIdent<'_> {
     rows.iter()
         .filter_map(|row| {
             let ident = row.get("Ident")?.as_str()?.to_string();
-            Some((ident, row.clone()))
+            Some((ident, row))
         })
         .collect()
 }
 
 fn build_reference_airway_row_map_by_ident(
     rows: &[AirwayReferenceRow],
-) -> HashMap<String, Map<String, Value>> {
-    rows.iter()
-        .map(|row| (row.ident.clone(), row.to_map()))
-        .collect()
+) -> ReferenceAirwayRowsByIdent<'_> {
+    rows.iter().map(|row| (row.ident.clone(), row)).collect()
 }
 
-fn next_reference_airway_id(rows: &[AirwayReferenceRow]) -> i64 {
-    rows.iter().map(|row| row.id).max().unwrap_or(0) + 1
-}
-
-fn group_airway_legs_by_ident(
-    rows: &[Map<String, Value>],
+fn group_airway_legs_by_ident<'a>(
+    rows: &'a [Map<String, Value>],
     airway_ident_by_id: &HashMap<i64, String>,
-) -> HashMap<String, Vec<Map<String, Value>>> {
-    let mut grouped: HashMap<String, Vec<Map<String, Value>>> = HashMap::new();
+) -> SourceLegRowsByIdent<'a> {
+    let mut grouped: SourceLegRowsByIdent<'a> = HashMap::new();
     for row in rows {
         let Some(airway_id) = json_to_i64(row.get("AirwayID")) else {
             continue;
@@ -249,33 +327,33 @@ fn group_airway_legs_by_ident(
         let Some(ident) = airway_ident_by_id.get(&airway_id) else {
             continue;
         };
-        grouped.entry(ident.clone()).or_default().push(row.clone());
+        grouped.entry(ident.clone()).or_default().push(row);
     }
     grouped
 }
 
-fn group_reference_airway_legs_by_ident(
-    rows: &[AirwayLegReferenceRow],
+fn group_reference_airway_legs_by_ident<'a>(
+    rows: &'a [AirwayLegReferenceRow],
     airway_ident_by_id: &HashMap<i64, String>,
-) -> HashMap<String, Vec<Map<String, Value>>> {
-    let mut grouped: HashMap<String, Vec<Map<String, Value>>> = HashMap::new();
+) -> ReferenceLegRowsByIdent<'a> {
+    let mut grouped: ReferenceLegRowsByIdent<'a> = HashMap::new();
     for row in rows {
         let Some(ident) = airway_ident_by_id.get(&row.airway_id) else {
             continue;
         };
-        grouped.entry(ident.clone()).or_default().push(row.to_map());
+        grouped.entry(ident.clone()).or_default().push(row);
     }
     grouped
 }
 
-fn has_connection(source_chains: &[Chain], existing_legs: &[Map<String, Value>]) -> bool {
+fn has_connection(source_chains: &[Chain], existing_legs: &[&AirwayLegReferenceRow]) -> bool {
     if source_chains.is_empty() || existing_legs.is_empty() {
         return false;
     }
 
     for row in existing_legs {
-        let from = row_text(row, "Waypoint1");
-        let to = row_text(row, "Waypoint2");
+        let from = row.waypoint1.trim();
+        let to = row.waypoint2.trim();
         if from.is_empty() || to.is_empty() {
             continue;
         }
@@ -297,7 +375,7 @@ fn path_distance(chain: &Chain, left: &str, right: &str) -> Option<usize> {
     Some(li.abs_diff(ri))
 }
 
-fn extract_chains(rows: &[Map<String, Value>]) -> Vec<Chain> {
+fn extract_chains(rows: &[&Map<String, Value>]) -> Vec<Chain> {
     let mut chains = Vec::new();
     let mut current_points: Vec<String> = Vec::new();
 
@@ -388,7 +466,7 @@ fn extract_chains(rows: &[Map<String, Value>]) -> Vec<Chain> {
 
 fn build_expected_directionality(
     ident: &str,
-    rows: &[Map<String, Value>],
+    rows: &[&Map<String, Value>],
     mirror_reference: &super::AirwayMirrorReference,
 ) -> SourceDirectionality {
     let mut directed = HashSet::new();
@@ -418,8 +496,8 @@ fn build_expected_directionality(
 fn merge_with_insertion_strategy(
     ident: &str,
     airway_id: i64,
-    source_legs: &[Map<String, Value>],
-    existing_legs: &[Map<String, Value>],
+    source_legs: &[&Map<String, Value>],
+    existing_legs: &[&AirwayLegReferenceRow],
     source_chains: &[Chain],
     source_directionality: &SourceDirectionality,
     mirror_reference: &super::AirwayMirrorReference,
@@ -428,11 +506,16 @@ fn merge_with_insertion_strategy(
     let template_lookup = build_template_lookup(source_legs, existing_legs);
 
     let mut merged = Vec::new();
+    let mut seen = HashSet::new();
     for row in existing_legs {
-        let from = row_text(row, "Waypoint1");
-        let to = row_text(row, "Waypoint2");
+        let from = row.waypoint1.trim();
+        let to = row.waypoint2.trim();
         if from.is_empty() || to.is_empty() {
-            merged.push(clone_leg_with_new_id(row, airway_id, next_leg_id));
+            let cloned = clone_reference_leg_with_new_id(row, airway_id, next_leg_id);
+            if let Some(edge) = directed_edge_from_row(&cloned) {
+                seen.insert(edge);
+            }
+            merged.push(cloned);
             continue;
         }
 
@@ -440,8 +523,8 @@ fn merge_with_insertion_strategy(
         if let Some(points) = insert_path
             && points.len() > 2
         {
-            let mark_start = json_to_i64(row.get("IsStart")) == Some(1);
-            let mark_end = json_to_i64(row.get("IsEnd")) == Some(1);
+            let mark_start = row.is_start == 1;
+            let mark_end = row.is_end == 1;
             let inserted = build_rows_from_points(
                 airway_id,
                 &points,
@@ -450,14 +533,22 @@ fn merge_with_insertion_strategy(
                 mark_start,
                 mark_end,
             );
-            merged.extend(inserted);
+            for inserted_row in inserted {
+                if let Some(edge) = directed_edge_from_row(&inserted_row) {
+                    seen.insert(edge);
+                }
+                merged.push(inserted_row);
+            }
             continue;
         }
 
-        merged.push(clone_leg_with_new_id(row, airway_id, next_leg_id));
+        let cloned = clone_reference_leg_with_new_id(row, airway_id, next_leg_id);
+        if let Some(edge) = directed_edge_from_row(&cloned) {
+            seen.insert(edge);
+        }
+        merged.push(cloned);
     }
 
-    let mut seen = build_directed_set(&merged);
     for row in source_legs {
         let level = row_text(row, "Level");
         let from = row_text(row, "Waypoint1");
@@ -478,24 +569,22 @@ fn merge_with_insertion_strategy(
 fn build_independent_append(
     ident: &str,
     airway_id: i64,
-    source_legs: &[Map<String, Value>],
+    source_legs: &[&Map<String, Value>],
     source_directionality: &SourceDirectionality,
-    airway_reference: &AirwayReferenceData,
+    mirror_reference: &super::AirwayMirrorReference,
     next_leg_id: &mut i64,
 ) -> Vec<Map<String, Value>> {
-    let mut rows: Vec<Map<String, Value>> = source_legs
-        .iter()
-        .map(|row| clone_leg_with_new_id(row, airway_id, next_leg_id))
-        .collect();
+    let mut rows = Vec::with_capacity(source_legs.len());
+    let mut seen = HashSet::new();
+    for row in source_legs {
+        let cloned = clone_leg_with_new_id(row, airway_id, next_leg_id);
+        if let Some(edge) = directed_edge_from_row(&cloned) {
+            seen.insert(edge);
+        }
+        rows.push(cloned);
+    }
 
-    let mut seen = build_directed_set(&rows);
-    rows = apply_mirror_rows(
-        ident,
-        rows,
-        &mut seen,
-        &airway_reference.mirror_reference,
-        next_leg_id,
-    );
+    rows = apply_mirror_rows(ident, rows, &mut seen, mirror_reference, next_leg_id);
     reconcile_and_dedup_directionality(rows, source_directionality)
 }
 
@@ -508,24 +597,24 @@ fn apply_mirror_rows(
 ) -> Vec<Map<String, Value>> {
     let original_len = rows.len();
     for idx in (0..original_len).rev() {
-        let row = rows[idx].clone();
-        let level = row_text(&row, "Level");
-        let from = row_text(&row, "Waypoint1");
-        let to = row_text(&row, "Waypoint2");
-        if from.is_empty() || to.is_empty() {
+        let Some(reverse) = ({
+            let row = &rows[idx];
+            let level = row_text(row, "Level");
+            let from = row_text(row, "Waypoint1");
+            let to = row_text(row, "Waypoint2");
+            if from.is_empty() || to.is_empty() {
+                None
+            } else if !mirror_reference.should_mirror(ident, level, from, to) {
+                None
+            } else {
+                let reverse = directed_edge(level, to, from);
+                (!existing_directed.contains(&reverse)).then_some(reverse)
+            }
+        }) else {
             continue;
-        }
+        };
 
-        if !mirror_reference.should_mirror(ident, level, from, to) {
-            continue;
-        }
-
-        let reverse = directed_edge(level, to, from);
-        if existing_directed.contains(&reverse) {
-            continue;
-        }
-
-        let mut mirrored = row;
+        let mut mirrored = rows[idx].clone();
         mirrored.insert("ID".to_string(), Value::Number(Number::from(*next_leg_id)));
         *next_leg_id += 1;
         swap(&mut mirrored, "Waypoint1ID", "Waypoint2ID");
@@ -584,12 +673,12 @@ fn slice_points_between(chain: &Chain, from: &str, to: &str) -> Option<Vec<Strin
 }
 
 fn build_template_lookup(
-    source_legs: &[Map<String, Value>],
-    existing_legs: &[Map<String, Value>],
+    source_legs: &[&Map<String, Value>],
+    existing_legs: &[&AirwayLegReferenceRow],
 ) -> HashMap<(String, String), SegmentTemplate> {
     let mut map = HashMap::new();
 
-    for row in source_legs.iter().chain(existing_legs.iter()) {
+    for row in source_legs {
         let from = row_text(row, "Waypoint1");
         let to = row_text(row, "Waypoint2");
         if from.is_empty() || to.is_empty() {
@@ -598,12 +687,25 @@ fn build_template_lookup(
 
         map.entry(undirected_pair(from, to))
             .or_insert_with(|| SegmentTemplate {
-                level: row
-                    .get("Level")
-                    .cloned()
-                    .unwrap_or(Value::String("B".to_string())),
-                from_id: row.get("Waypoint1ID").cloned().unwrap_or(Value::Null),
-                to_id: row.get("Waypoint2ID").cloned().unwrap_or(Value::Null),
+                level: row_text(row, "Level").to_string(),
+                from_id: json_to_i64(row.get("Waypoint1ID")),
+                to_id: json_to_i64(row.get("Waypoint2ID")),
+                from_name: from.to_string(),
+            });
+    }
+
+    for row in existing_legs {
+        let from = row.waypoint1.trim();
+        let to = row.waypoint2.trim();
+        if from.is_empty() || to.is_empty() {
+            continue;
+        }
+
+        map.entry(undirected_pair(from, to))
+            .or_insert_with(|| SegmentTemplate {
+                level: row.level.trim().to_string(),
+                from_id: Some(row.waypoint1_id),
+                to_id: Some(row.waypoint2_id),
                 from_name: from.to_string(),
             });
     }
@@ -633,28 +735,48 @@ fn build_rows_from_points(
             .get(&key)
             .cloned()
             .unwrap_or(SegmentTemplate {
-                level: Value::String("B".to_string()),
-                from_id: Value::Null,
-                to_id: Value::Null,
+                level: "B".to_string(),
+                from_id: None,
+                to_id: None,
                 from_name: from.clone(),
             });
 
-        let mut row = Map::new();
+        let mut row = Map::with_capacity(9);
         row.insert("ID".to_string(), Value::Number(Number::from(*next_leg_id)));
         *next_leg_id += 1;
         row.insert(
             "AirwayID".to_string(),
             Value::Number(Number::from(airway_id)),
         );
-        row.insert("Level".to_string(), template.level.clone());
+        row.insert("Level".to_string(), Value::String(template.level.clone()));
 
         let oriented_same = template.from_name == *from;
         if oriented_same {
-            row.insert("Waypoint1ID".to_string(), template.from_id.clone());
-            row.insert("Waypoint2ID".to_string(), template.to_id.clone());
+            row.insert(
+                "Waypoint1ID".to_string(),
+                template
+                    .from_id
+                    .map_or(Value::Null, |value| Value::Number(Number::from(value))),
+            );
+            row.insert(
+                "Waypoint2ID".to_string(),
+                template
+                    .to_id
+                    .map_or(Value::Null, |value| Value::Number(Number::from(value))),
+            );
         } else {
-            row.insert("Waypoint1ID".to_string(), template.to_id.clone());
-            row.insert("Waypoint2ID".to_string(), template.from_id.clone());
+            row.insert(
+                "Waypoint1ID".to_string(),
+                template
+                    .to_id
+                    .map_or(Value::Null, |value| Value::Number(Number::from(value))),
+            );
+            row.insert(
+                "Waypoint2ID".to_string(),
+                template
+                    .from_id
+                    .map_or(Value::Null, |value| Value::Number(Number::from(value))),
+            );
         }
 
         row.insert(
@@ -755,6 +877,16 @@ fn clone_leg_with_new_id(
     cloned
 }
 
+fn clone_reference_leg_with_new_id(
+    row: &AirwayLegReferenceRow,
+    airway_id: i64,
+    next_leg_id: &mut i64,
+) -> Map<String, Value> {
+    let cloned = row.to_map_with_ids(*next_leg_id, airway_id);
+    *next_leg_id += 1;
+    cloned
+}
+
 fn directed_edge_from_row(row: &Map<String, Value>) -> Option<DirectedEdge> {
     let level = row_text(row, "Level");
     let from = row_text(row, "Waypoint1");
@@ -763,10 +895,6 @@ fn directed_edge_from_row(row: &Map<String, Value>) -> Option<DirectedEdge> {
         return None;
     }
     Some(directed_edge(level, from, to))
-}
-
-fn build_directed_set(rows: &[Map<String, Value>]) -> HashSet<DirectedEdge> {
-    rows.iter().filter_map(directed_edge_from_row).collect()
 }
 
 fn undirected_edge(level: &str, left: &str, right: &str) -> UndirectedEdge {

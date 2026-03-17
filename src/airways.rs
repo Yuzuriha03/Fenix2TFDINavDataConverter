@@ -1,7 +1,7 @@
 mod merge;
 mod rte_seg;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
@@ -14,6 +14,9 @@ use serde_json::{Map, Number, Value};
 
 use crate::db_json::write_json_objects;
 use crate::stats::{AirwayTimingBreakdown, PhaseDurations, TableExportStats};
+
+pub(crate) use rte_seg::PreloadedRteSegData;
+pub(crate) use rte_seg::WaypointCandidate;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AirwayMirrorReference {
@@ -40,6 +43,14 @@ pub(crate) struct AirwayReferenceData {
     pub(super) mirror_reference: AirwayMirrorReference,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PreloadedAirwayReferenceJson {
+    pub(super) airways: Vec<AirwayReferenceRow>,
+    pub(super) airway_legs: Vec<AirwayLegReferenceRow>,
+}
+
+pub(crate) type PreloadedWaypointCandidates = HashMap<String, Vec<WaypointCandidate>>;
+
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct AirwayReferenceRow {
     #[serde(rename = "ID")]
@@ -49,9 +60,9 @@ pub(crate) struct AirwayReferenceRow {
 }
 
 impl AirwayReferenceRow {
-    pub(super) fn to_map(&self) -> Map<String, Value> {
+    pub(super) fn to_map_with_id(&self, id: i64) -> Map<String, Value> {
         let mut row = Map::with_capacity(2);
-        row.insert("ID".to_string(), Value::Number(Number::from(self.id)));
+        row.insert("ID".to_string(), Value::Number(Number::from(id)));
         row.insert("Ident".to_string(), Value::String(self.ident.clone()));
         row
     }
@@ -80,12 +91,12 @@ pub(crate) struct AirwayLegReferenceRow {
 }
 
 impl AirwayLegReferenceRow {
-    pub(super) fn to_map(&self) -> Map<String, Value> {
-        let mut row = Map::new();
-        row.insert("ID".to_string(), Value::Number(Number::from(self.id)));
+    pub(super) fn to_map_with_ids(&self, id: i64, airway_id: i64) -> Map<String, Value> {
+        let mut row = Map::with_capacity(9);
+        row.insert("ID".to_string(), Value::Number(Number::from(id)));
         row.insert(
             "AirwayID".to_string(),
-            Value::Number(Number::from(self.airway_id)),
+            Value::Number(Number::from(airway_id)),
         );
         row.insert("Level".to_string(), Value::String(self.level.clone()));
         row.insert(
@@ -245,18 +256,38 @@ pub(crate) fn export_airway_tables(
     output_dir: &Path,
     airway_reference: &AirwayReferenceData,
     rte_seg_path: &Path,
+    preloaded_rte_seg: Option<&PreloadedRteSegData>,
+    preloaded_waypoint_candidates: Option<&PreloadedWaypointCandidates>,
 ) -> Result<(Vec<TableExportStats>, AirwayTimingBreakdown)> {
     let airway_db_read_time = Default::default();
 
     let waypoint_candidate_start = Instant::now();
-    let rte_seg_rows = rte_seg::load_rte_seg_airway_rows(rte_seg_path)?;
-    let required_idents = rte_seg::collect_required_waypoint_idents(&rte_seg_rows);
-    let waypoint_candidates = rte_seg::load_waypoint_candidates_from_db(db_path, &required_idents)?;
-    let waypoint_candidates_load = waypoint_candidate_start.elapsed();
+    let owned_rte_seg_rows;
+    let rte_seg_rows = if let Some(preloaded_rte_seg) = preloaded_rte_seg {
+        preloaded_rte_seg.airway_rows.as_slice()
+    } else {
+        owned_rte_seg_rows = rte_seg::load_rte_seg_airway_rows(rte_seg_path)?;
+        owned_rte_seg_rows.as_slice()
+    };
+    let owned_waypoint_candidates;
+    let waypoint_candidates =
+        if let Some(preloaded_waypoint_candidates) = preloaded_waypoint_candidates {
+            preloaded_waypoint_candidates
+        } else {
+            let required_idents = rte_seg::collect_required_waypoint_idents(rte_seg_rows);
+            owned_waypoint_candidates =
+                rte_seg::load_waypoint_candidates_from_db(db_path, &required_idents)?;
+            &owned_waypoint_candidates
+        };
+    let waypoint_candidates_load = if preloaded_waypoint_candidates.is_some() {
+        Duration::default()
+    } else {
+        waypoint_candidate_start.elapsed()
+    };
 
     let airway_transform_start = Instant::now();
     let (formatted_airways, formatted_legs) =
-        rte_seg::build_airway_tables_from_rows(&rte_seg_rows, &waypoint_candidates);
+        rte_seg::build_airway_tables_from_rows(rte_seg_rows, &waypoint_candidates);
     let airway_transform_time = airway_transform_start.elapsed();
 
     let airway_leg_transform_start = Instant::now();
@@ -308,40 +339,54 @@ pub(crate) fn export_airway_tables(
 pub(crate) fn load_airway_reference(
     reference_dir: Option<&Path>,
     rte_seg_path: &Path,
+    preloaded_rte_seg: Option<&PreloadedRteSegData>,
+    preloaded_reference_json: Option<PreloadedAirwayReferenceJson>,
 ) -> Result<(AirwayReferenceData, AirwayReferenceLoadTiming)> {
     let mut timing = AirwayReferenceLoadTiming::default();
 
     let mirror_start = Instant::now();
-    let mirror_reference = rte_seg::load_rte_seg_mirror_reference(rte_seg_path)?;
+    let mirror_reference = if let Some(preloaded_rte_seg) = preloaded_rte_seg {
+        preloaded_rte_seg.mirror_reference.clone()
+    } else {
+        rte_seg::load_rte_seg_mirror_reference(rte_seg_path)?
+    };
     timing.mirror_reference = mirror_start.elapsed();
 
-    let Some(reference_dir) = reference_dir else {
-        return Ok((
-            AirwayReferenceData {
-                airways: Vec::new(),
-                airway_legs: Vec::new(),
-                mirror_reference,
-            },
-            timing,
-        ));
+    let (airways, airway_legs) = if let Some(preloaded_reference_json) = preloaded_reference_json {
+        (
+            preloaded_reference_json.airways,
+            preloaded_reference_json.airway_legs,
+        )
+    } else {
+        let Some(reference_dir) = reference_dir else {
+            return Ok((
+                AirwayReferenceData {
+                    airways: Vec::new(),
+                    airway_legs: Vec::new(),
+                    mirror_reference,
+                },
+                timing,
+            ));
+        };
+
+        let airways_path = reference_dir.join("Airways.json");
+        let airway_legs_path = reference_dir.join("AirwayLegs.json");
+        if !airways_path.exists() || !airway_legs_path.exists() {
+            bail!(
+                "reference directory is missing Airways.json or AirwayLegs.json: {}",
+                reference_dir.display()
+            );
+        }
+
+        let airways_start = Instant::now();
+        let airways = load_airways_reference(&airways_path)?;
+        timing.airways_json = airways_start.elapsed();
+
+        let airway_legs_start = Instant::now();
+        let airway_legs = load_airway_legs_reference(&airway_legs_path)?;
+        timing.airway_legs_json = airway_legs_start.elapsed();
+        (airways, airway_legs)
     };
-
-    let airways_path = reference_dir.join("Airways.json");
-    let airway_legs_path = reference_dir.join("AirwayLegs.json");
-    if !airways_path.exists() || !airway_legs_path.exists() {
-        bail!(
-            "reference directory is missing Airways.json or AirwayLegs.json: {}",
-            reference_dir.display()
-        );
-    }
-
-    let airways_start = Instant::now();
-    let airways = load_airways_reference(&airways_path)?;
-    timing.airways_json = airways_start.elapsed();
-
-    let airway_legs_start = Instant::now();
-    let airway_legs = load_airway_legs_reference(&airway_legs_path)?;
-    timing.airway_legs_json = airway_legs_start.elapsed();
 
     Ok((
         AirwayReferenceData {
@@ -363,4 +408,37 @@ fn undirected_airway_route_key(ident: &str, waypoint1: &str, waypoint2: &str) ->
     } else {
         directed_airway_route_key(ident, waypoint2, waypoint1)
     }
+}
+
+pub(crate) fn preload_rte_seg(rte_seg_path: &Path) -> Result<PreloadedRteSegData> {
+    rte_seg::preload_rte_seg(rte_seg_path)
+}
+
+pub(crate) fn preload_airway_reference_json(
+    reference_dir: Option<&Path>,
+) -> Result<Option<PreloadedAirwayReferenceJson>> {
+    let Some(reference_dir) = reference_dir else {
+        return Ok(None);
+    };
+
+    let airways_path = reference_dir.join("Airways.json");
+    let airway_legs_path = reference_dir.join("AirwayLegs.json");
+    if !airways_path.exists() || !airway_legs_path.exists() {
+        bail!(
+            "reference directory is missing Airways.json or AirwayLegs.json: {}",
+            reference_dir.display()
+        );
+    }
+
+    Ok(Some(PreloadedAirwayReferenceJson {
+        airways: load_airways_reference(&airways_path)?,
+        airway_legs: load_airway_legs_reference(&airway_legs_path)?,
+    }))
+}
+
+pub(crate) fn preload_waypoint_candidates(
+    db_path: &Path,
+    preloaded_rte_seg: &PreloadedRteSegData,
+) -> Result<PreloadedWaypointCandidates> {
+    rte_seg::load_waypoint_candidates_from_db(db_path, &preloaded_rte_seg.required_waypoint_idents)
 }

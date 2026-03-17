@@ -17,10 +17,10 @@ use crate::db_json::{
 use crate::stats::{PhaseDurations, TableExportStats, TableTimingBreakdown};
 
 #[derive(Clone, Debug)]
-struct ExistingJsonIndex {
-    path: PathBuf,
-    ids: HashSet<i64>,
-    row_count: usize,
+pub(crate) struct ExistingJsonIndex {
+    pub(crate) path: PathBuf,
+    pub(crate) ids: HashSet<i64>,
+    pub(crate) row_count: usize,
 }
 
 pub(crate) fn export_table_to_json(
@@ -28,13 +28,17 @@ pub(crate) fn export_table_to_json(
     output_dir: &Path,
     base_json_dir: Option<&Path>,
     table_name: &str,
-    waypoints: &HashMap<i64, String>,
+    waypoints: Option<&HashMap<i64, String>>,
+    preloaded_existing_index: Option<ExistingJsonIndex>,
 ) -> Result<TableExportStats> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("failed to open database: {}", db_path.display()))?;
     configure_read_connection(&conn);
     let existing_load_start = Instant::now();
-    let existing_merge = load_existing_id_index(base_json_dir, table_name)?;
+    let existing_merge = match preloaded_existing_index {
+        Some(existing) => Some(existing),
+        None => load_existing_id_index(base_json_dir, table_name)?,
+    };
     let existing_load_time = existing_load_start.elapsed();
 
     let db_read_start = Instant::now();
@@ -100,17 +104,17 @@ pub(crate) fn export_table_to_json(
     })
 }
 
-pub(crate) fn fetch_waypoints(conn: &Connection) -> Result<HashMap<i64, String>> {
-    let mut statement = conn
-        .prepare("SELECT ID, Ident FROM Waypoints")
-        .context("failed to query Waypoints")?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })
-        .context("failed to iterate Waypoints")?;
-    rows.collect::<rusqlite::Result<HashMap<_, _>>>()
-        .context("failed to build Waypoints lookup")
+pub(crate) fn preload_existing_table_indices(
+    base_json_dir: Option<&Path>,
+    table_names: &[&str],
+) -> Result<HashMap<String, ExistingJsonIndex>> {
+    let mut indices = HashMap::new();
+    for &table_name in table_names {
+        if let Some(index) = load_existing_id_index(base_json_dir, table_name)? {
+            indices.insert(table_name.to_string(), index);
+        }
+    }
+    Ok(indices)
 }
 
 fn load_existing_id_index(

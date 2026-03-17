@@ -8,6 +8,7 @@ use encoding_rs::GBK;
 use rusqlite::Connection;
 use rusqlite::params;
 use rusqlite::types::Value as SqlValue;
+use serde::Serialize;
 use serde_json::{Map, Number, Value};
 
 const DEFAULT_JSON_WRITE_BUFFER_CAPACITY: usize = 1024 * 1024;
@@ -144,7 +145,7 @@ pub(crate) fn sql_value_to_json(value: SqlValue) -> Value {
 pub(crate) fn format_row(
     mut row: Map<String, Value>,
     table_name: &str,
-    waypoints: &HashMap<i64, String>,
+    waypoints: Option<&HashMap<i64, String>>,
 ) -> Map<String, Value> {
     if let Some(value) = row.remove("Longtitude") {
         row.insert("Longitude".to_string(), round_json_number(&value));
@@ -201,7 +202,7 @@ pub(crate) fn format_row(
                 row.insert(
                     "Waypoint1".to_string(),
                     waypoints
-                        .get(&waypoint_id)
+                        .and_then(|lookup| lookup.get(&waypoint_id))
                         .cloned()
                         .map(Value::String)
                         .unwrap_or(Value::Null),
@@ -214,7 +215,7 @@ pub(crate) fn format_row(
                 row.insert(
                     "Waypoint2".to_string(),
                     waypoints
-                        .get(&waypoint_id)
+                        .and_then(|lookup| lookup.get(&waypoint_id))
                         .cloned()
                         .map(Value::String)
                         .unwrap_or(Value::Null),
@@ -260,13 +261,13 @@ pub(crate) fn json_to_i64(value: Option<&Value>) -> Option<i64> {
     }
 }
 
-pub(crate) fn write_json_objects(path: &Path, rows: &[Map<String, Value>]) -> Result<()> {
+pub(crate) fn write_json_objects<T: Serialize>(path: &Path, rows: &[T]) -> Result<()> {
     write_json_objects_with_buffer(path, rows, DEFAULT_JSON_WRITE_BUFFER_CAPACITY)
 }
 
-pub(crate) fn write_json_objects_with_buffer(
+pub(crate) fn write_json_objects_with_buffer<T: Serialize>(
     path: &Path,
-    rows: &[Map<String, Value>],
+    rows: &[T],
     buffer_capacity: usize,
 ) -> Result<()> {
     let file =
@@ -277,9 +278,9 @@ pub(crate) fn write_json_objects_with_buffer(
     Ok(())
 }
 
-pub(crate) fn write_json_objects_if_changed_with_buffer(
+pub(crate) fn write_json_objects_if_changed_with_buffer<T: Serialize>(
     path: &Path,
-    rows: &[Map<String, Value>],
+    rows: &[T],
     buffer_capacity: usize,
 ) -> Result<bool> {
     if !path.exists() {
