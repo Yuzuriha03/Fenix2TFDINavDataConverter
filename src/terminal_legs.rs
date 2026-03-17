@@ -9,9 +9,12 @@ use rusqlite::{Connection, params, params_from_iter};
 use serde_json::{Map, Number, Value};
 
 use crate::db_json::{
-    configure_read_connection, json_to_i64, sql_value_to_json, write_json_objects_if_changed,
+    configure_read_connection, json_to_i64, sql_value_to_json,
+    write_json_objects_if_changed_with_buffer, write_json_objects_with_buffer,
 };
 use crate::stats::{PhaseDurations, TerminalLegExportStats, TerminalLegTimingBreakdown};
+
+const PROCEDURE_LEG_JSON_BUFFER_CAPACITY: usize = 16 * 1024;
 
 #[derive(Clone, Debug)]
 struct TerminalLegRecord {
@@ -21,10 +24,12 @@ struct TerminalLegRecord {
     transition: Value,
     track_code: Value,
     wpt_id: Value,
+    wpt_id_num: Option<i64>,
     wpt_lat: Value,
     wpt_lon: Value,
     turn_dir: Value,
     nav_id: Value,
+    nav_id_num: Option<i64>,
     nav_lat: Value,
     nav_lon: Value,
     nav_bear: Value,
@@ -33,11 +38,15 @@ struct TerminalLegRecord {
     distance: Value,
     alt: Value,
     vnav: Value,
+    vnav_num: Option<f64>,
     center_id: Value,
+    center_id_num: Option<i64>,
     center_lat: Value,
     center_lon: Value,
     is_fly_over: Value,
+    is_fly_over_num: Option<i64>,
     speed_limit: Value,
+    speed_limit_num: Option<i64>,
     is_faf: i64,
     is_map: i64,
 }
@@ -46,7 +55,13 @@ impl TerminalLegRecord {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         let id = row.get::<_, i64>(0)?;
         let terminal_id = row.get::<_, i64>(1)?;
+        let wpt_id = sql_value_to_json(row.get(5)?);
+        let nav_id = sql_value_to_json(row.get(9)?);
         let alt = sql_value_to_json(row.get(16)?);
+        let vnav = sql_value_to_json(row.get(17)?);
+        let center_id = sql_value_to_json(row.get(18)?);
+        let is_fly_over = sql_value_to_json(row.get(21)?);
+        let speed_limit = sql_value_to_json(row.get(22)?);
         let is_map = matches!(&alt, Value::String(text) if text == "MAP");
         Ok(Self {
             id,
@@ -54,11 +69,13 @@ impl TerminalLegRecord {
             leg_type: sql_value_to_json(row.get(2)?),
             transition: sql_value_to_json(row.get(3)?),
             track_code: sql_value_to_json(row.get(4)?),
-            wpt_id: sql_value_to_json(row.get(5)?),
+            wpt_id_num: json_to_i64(Some(&wpt_id)),
+            wpt_id,
             wpt_lat: sql_value_to_json(row.get(6)?),
             wpt_lon: sql_value_to_json(row.get(7)?),
             turn_dir: sql_value_to_json(row.get(8)?),
-            nav_id: sql_value_to_json(row.get(9)?),
+            nav_id_num: json_to_i64(Some(&nav_id)),
+            nav_id,
             nav_lat: sql_value_to_json(row.get(10)?),
             nav_lon: sql_value_to_json(row.get(11)?),
             nav_bear: sql_value_to_json(row.get(12)?),
@@ -66,12 +83,16 @@ impl TerminalLegRecord {
             course: sql_value_to_json(row.get(14)?),
             distance: sql_value_to_json(row.get(15)?),
             alt,
-            vnav: sql_value_to_json(row.get(17)?),
-            center_id: sql_value_to_json(row.get(18)?),
+            vnav_num: parse_vnav(Some(&vnav)),
+            vnav,
+            center_id_num: json_to_i64(Some(&center_id)),
+            center_id,
             center_lat: sql_value_to_json(row.get(19)?),
             center_lon: sql_value_to_json(row.get(20)?),
-            is_fly_over: sql_value_to_json(row.get(21)?),
-            speed_limit: sql_value_to_json(row.get(22)?),
+            is_fly_over_num: json_to_i64(Some(&is_fly_over)),
+            is_fly_over,
+            speed_limit_num: json_to_i64(Some(&speed_limit)),
+            speed_limit,
             is_faf: 0,
             is_map: if is_map { -1 } else { 0 },
         })
@@ -86,8 +107,7 @@ impl TerminalLegRecord {
         let missing_wpt = value_is_null(&self.wpt_id)
             && value_is_null(&self.wpt_lat)
             && value_is_null(&self.wpt_lon);
-        let is_map = matches!(&self.alt, Value::String(text) if text == "MAP");
-        if missing_wpt && is_map {
+        if missing_wpt && self.is_map == -1 {
             if let Some(runway_id) = runway_ids_by_terminal.get(&self.terminal_id)
                 && let Some(coords) = runway_coords.get(runway_id)
             {
@@ -98,7 +118,7 @@ impl TerminalLegRecord {
         }
 
         if should_fill_value(&self.wpt_id, &self.wpt_lat, &self.wpt_lon) {
-            if let Some(point_id) = json_to_i64(Some(&self.wpt_id))
+            if let Some(point_id) = self.wpt_id_num
                 && let Some(coords) = waypoint_coords.get(&point_id)
             {
                 self.wpt_lat = rounded_number_value(coords.0);
@@ -108,7 +128,7 @@ impl TerminalLegRecord {
         }
 
         if should_fill_value(&self.center_id, &self.center_lat, &self.center_lon) {
-            if let Some(point_id) = json_to_i64(Some(&self.center_id))
+            if let Some(point_id) = self.center_id_num
                 && let Some(coords) = waypoint_coords.get(&point_id)
             {
                 self.center_lat = rounded_number_value(coords.0);
@@ -118,7 +138,7 @@ impl TerminalLegRecord {
         }
 
         if should_fill_value(&self.nav_id, &self.nav_lat, &self.nav_lon)
-            && let Some(point_id) = json_to_i64(Some(&self.nav_id))
+            && let Some(point_id) = self.nav_id_num
             && let Some(coords) = waypoint_coords.get(&point_id)
         {
             self.nav_lat = rounded_number_value(coords.0);
@@ -127,7 +147,7 @@ impl TerminalLegRecord {
     }
 
     fn vnav(&self) -> Option<f64> {
-        parse_vnav(Some(&self.vnav))
+        self.vnav_num
     }
 
     fn to_output_map(&self) -> Map<String, Value> {
@@ -161,7 +181,7 @@ impl TerminalLegRecord {
         ordered.insert("CenterLon".to_string(), self.center_lon.clone());
         ordered.insert(
             "IsFlyOver".to_string(),
-            if json_to_i64(Some(&self.is_fly_over)) == Some(1) {
+            if self.is_fly_over_num == Some(1) {
                 Value::Number(Number::from(-1))
             } else {
                 self.is_fly_over.clone()
@@ -169,7 +189,7 @@ impl TerminalLegRecord {
         );
         ordered.insert(
             "SpeedLimit".to_string(),
-            json_to_i64(Some(&self.speed_limit))
+            self.speed_limit_num
                 .map(Number::from)
                 .map(Value::Number)
                 .unwrap_or_else(|| self.speed_limit.clone()),
@@ -191,51 +211,58 @@ pub(crate) fn export_terminal_legs(
     start_terminal_id: i64,
     output_dir: &Path,
 ) -> Result<TerminalLegExportStats> {
+    let cleanup_required =
+        procedure_dir_has_existing_files_from(output_dir, start_terminal_id)?;
+    let files_may_already_exist = cleanup_required;
     let db_read_start = Instant::now();
     let (
         terminal_legs,
         runway_ids_by_terminal,
-        terminal_ids,
+        terminal_ids_for_cleanup,
         runway_coords,
         waypoint_coords,
         mut detail,
     ) = with_connection(db_path, |conn| {
-            let t_terminal_legs = Instant::now();
-            let terminal_legs = fetch_terminal_legs(conn, start_terminal_id)?;
-            let db_terminal_legs = t_terminal_legs.elapsed();
+        let t_terminal_legs = Instant::now();
+        let terminal_legs = fetch_terminal_legs(conn, start_terminal_id)?;
+        let db_terminal_legs = t_terminal_legs.elapsed();
 
-            let t_terminal_metadata = Instant::now();
-            let (runway_ids_by_terminal, terminal_ids) = fetch_terminal_metadata(conn)?;
-            let db_terminal_metadata = t_terminal_metadata.elapsed();
+        let t_terminal_metadata = Instant::now();
+        let runway_ids_by_terminal =
+            fetch_runway_ids_by_terminal_after_start(conn, start_terminal_id)?;
+        let terminal_ids_for_cleanup = if cleanup_required {
+            Some(fetch_all_terminal_ids(conn)?)
+        } else {
+            None
+        };
+        let db_terminal_metadata = t_terminal_metadata.elapsed();
 
-            let runway_ids: HashSet<i64> = runway_ids_by_terminal.values().copied().collect();
-            let waypoint_ids = collect_waypoint_reference_ids(&terminal_legs);
+        let runway_ids: HashSet<i64> = runway_ids_by_terminal.values().copied().collect();
+        let waypoint_ids = collect_waypoint_reference_ids(&terminal_legs);
 
-            let t_runway_coords = Instant::now();
-            let runway_coords = fetch_runway_coordinates_by_ids(conn, &runway_ids)?;
-            let db_runway_coords = t_runway_coords.elapsed();
+        let t_runway_coords = Instant::now();
+        let runway_coords = fetch_runway_coordinates_by_ids(conn, &runway_ids)?;
+        let db_runway_coords = t_runway_coords.elapsed();
 
-            let t_waypoint_coords = Instant::now();
-            let waypoint_coords = fetch_waypoint_coordinates_by_ids(conn, &waypoint_ids)?;
-            let db_waypoint_coords = t_waypoint_coords.elapsed();
+        let t_waypoint_coords = Instant::now();
+        let waypoint_coords = fetch_waypoint_coordinates_by_ids(conn, &waypoint_ids)?;
+        let db_waypoint_coords = t_waypoint_coords.elapsed();
 
-            Ok::<_, anyhow::Error>(
-                (
-                    terminal_legs,
-                    runway_ids_by_terminal,
-                    terminal_ids,
-                    runway_coords,
-                    waypoint_coords,
-                    TerminalLegTimingBreakdown {
-                        db_terminal_legs,
-                        db_terminal_metadata,
-                        db_runway_coords,
-                        db_waypoint_coords,
-                        ..Default::default()
-                    },
-                ),
-            )
-        })?;
+        Ok::<_, anyhow::Error>((
+            terminal_legs,
+            runway_ids_by_terminal,
+            terminal_ids_for_cleanup,
+            runway_coords,
+            waypoint_coords,
+            TerminalLegTimingBreakdown {
+                db_terminal_legs,
+                db_terminal_metadata,
+                db_runway_coords,
+                db_waypoint_coords,
+                ..Default::default()
+            },
+        ))
+    })?;
     let db_read_time = db_read_start.elapsed();
     let row_count = terminal_legs.len();
 
@@ -248,10 +275,7 @@ pub(crate) fn export_terminal_legs(
             .or_default()
             .push(leg);
     }
-    let terminal_jobs: Vec<(i64, Vec<TerminalLegRecord>)> = terminal_groups
-        .into_iter()
-        .filter(|(terminal_id, _)| terminal_ids.contains(terminal_id))
-        .collect();
+    let terminal_jobs: Vec<(i64, Vec<TerminalLegRecord>)> = terminal_groups.into_iter().collect();
     let file_count = terminal_jobs.len();
     let json_transform_time = json_transform_start.elapsed();
     detail.group_rows = json_transform_time;
@@ -266,12 +290,27 @@ pub(crate) fn export_terminal_legs(
             let output_path = output_dir
                 .join("ProcedureLegs")
                 .join(format!("TermID_{terminal_id}.json"));
-            write_json_objects_if_changed(&output_path, &ordered_legs).map(|_| ())
+            if files_may_already_exist {
+                write_json_objects_if_changed_with_buffer(
+                    &output_path,
+                    &ordered_legs,
+                    PROCEDURE_LEG_JSON_BUFFER_CAPACITY,
+                )
+                .map(|_| ())
+            } else {
+                write_json_objects_with_buffer(
+                    &output_path,
+                    &ordered_legs,
+                    PROCEDURE_LEG_JSON_BUFFER_CAPACITY,
+                )
+            }
         })?;
 
-    let cleanup_start = Instant::now();
-    let _ = cleanup_extra_procedure_files(output_dir, &terminal_ids)?;
-    detail.cleanup_files = cleanup_start.elapsed();
+    if let Some(terminal_ids) = terminal_ids_for_cleanup {
+        let cleanup_start = Instant::now();
+        let _ = cleanup_extra_procedure_files(output_dir, &terminal_ids)?;
+        detail.cleanup_files = cleanup_start.elapsed();
+    }
 
     Ok(TerminalLegExportStats {
         row_count,
@@ -308,25 +347,74 @@ fn fetch_terminal_legs(
         .context("failed to read TerminalLegs")
 }
 
-fn fetch_terminal_metadata(conn: &Connection) -> Result<(HashMap<i64, i64>, HashSet<i64>)> {
+fn fetch_runway_ids_by_terminal_after_start(
+    conn: &Connection,
+    start_terminal_id: i64,
+) -> Result<HashMap<i64, i64>> {
     let mut statement = conn
-        .prepare("SELECT ID, RwyID FROM Terminals")
+        .prepare("SELECT ID, RwyID FROM Terminals WHERE ID >= ? AND RwyID IS NOT NULL")
         .context("failed to query terminal runway ids")?;
     let rows = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+        .query_map(params![start_terminal_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
         })
         .context("failed to iterate terminal runway ids")?;
     let mut runway_ids_by_terminal = HashMap::new();
-    let mut terminal_ids = HashSet::new();
     for row in rows {
         let (terminal_id, runway_id) = row.context("failed to read terminal runway id row")?;
-        terminal_ids.insert(terminal_id);
-        if let Some(runway_id) = runway_id {
-            runway_ids_by_terminal.insert(terminal_id, runway_id);
+        runway_ids_by_terminal.insert(terminal_id, runway_id);
+    }
+    Ok(runway_ids_by_terminal)
+}
+
+fn fetch_all_terminal_ids(conn: &Connection) -> Result<HashSet<i64>> {
+    let mut statement = conn
+        .prepare("SELECT ID FROM Terminals")
+        .context("failed to query terminal ids")?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, i64>(0))
+        .context("failed to iterate terminal ids")?;
+    rows.collect::<rusqlite::Result<HashSet<_>>>()
+        .context("failed to read terminal ids")
+}
+
+fn procedure_dir_has_existing_files_from(output_dir: &Path, min_terminal_id: i64) -> Result<bool> {
+    let procedure_dir = output_dir.join("ProcedureLegs");
+    if !procedure_dir.exists() {
+        return Ok(false);
+    }
+
+    for entry in fs::read_dir(&procedure_dir).with_context(|| {
+        format!(
+            "failed to read ProcedureLegs directory: {}",
+            procedure_dir.display()
+        )
+    })? {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to read ProcedureLegs entry: {}",
+                procedure_dir.display()
+            )
+        })?;
+        let file_name = match entry.file_name().into_string() {
+            Ok(name) => name,
+            Err(_) => continue,
+        };
+        let Some(number_text) = file_name
+            .strip_prefix("TermID_")
+            .and_then(|value| value.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        let Ok(terminal_id) = number_text.parse::<i64>() else {
+            continue;
+        };
+        if terminal_id >= min_terminal_id {
+            return Ok(true);
         }
     }
-    Ok((runway_ids_by_terminal, terminal_ids))
+
+    Ok(false)
 }
 
 fn cleanup_extra_procedure_files(
@@ -382,13 +470,13 @@ fn cleanup_extra_procedure_files(
 fn collect_waypoint_reference_ids(terminal_legs: &[TerminalLegRecord]) -> HashSet<i64> {
     let mut ids = HashSet::new();
     for leg in terminal_legs {
-        if let Some(id) = json_to_i64(Some(&leg.wpt_id)) {
+        if let Some(id) = leg.wpt_id_num {
             ids.insert(id);
         }
-        if let Some(id) = json_to_i64(Some(&leg.center_id)) {
+        if let Some(id) = leg.center_id_num {
             ids.insert(id);
         }
-        if let Some(id) = json_to_i64(Some(&leg.nav_id)) {
+        if let Some(id) = leg.nav_id_num {
             ids.insert(id);
         }
     }

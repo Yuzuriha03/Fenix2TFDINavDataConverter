@@ -14,8 +14,8 @@ use rusqlite::Connection;
 
 use airways::{export_airway_tables, load_airway_reference};
 use config::{
-    detect_start_terminal_id, parse_args, prepare_output_directory, prompt_db3_path,
-    prompt_rte_seg_path, validate_required_tables,
+    debug_sample_dir, detect_start_terminal_id, parse_args, prepare_debug_output_from_reference,
+    prepare_output_directory, prompt_db3_path, prompt_rte_seg_path, validate_required_tables,
 };
 use db_json::configure_read_connection;
 use stats::{ExportStats, PhaseDurations};
@@ -42,6 +42,7 @@ fn main() {
 fn run() -> Result<()> {
     let config = parse_args()?;
     let total_start = Instant::now();
+    let mut debug_seed_copy_time = Duration::default();
 
     let resolve_paths_start = Instant::now();
     let rte_seg_path = match &config.rte_seg_path {
@@ -55,9 +56,24 @@ fn run() -> Result<()> {
     };
     let resolve_paths_time = resolve_paths_start.elapsed();
 
+    let runtime_reference_dir = if config.debug {
+        if let (Some(reference_dir), Some(output_target)) =
+            (config.reference_dir.as_deref(), config.output_targets.first())
+        {
+            let copy_start = Instant::now();
+            prepare_debug_output_from_reference(reference_dir, &output_target.path)?;
+            debug_seed_copy_time = copy_start.elapsed();
+            Some(output_target.path.clone())
+        } else {
+            config.reference_dir.clone()
+        }
+    } else {
+        config.reference_dir.clone()
+    };
+
     let load_airway_reference_start = Instant::now();
     let (airway_reference, airway_reference_load_timing) =
-        load_airway_reference(config.reference_dir.as_deref(), &rte_seg_path)?;
+        load_airway_reference(runtime_reference_dir.as_deref(), &rte_seg_path)?;
     let load_airway_reference_time = load_airway_reference_start.elapsed();
 
     let validate_db_start = Instant::now();
@@ -91,7 +107,7 @@ fn run() -> Result<()> {
             &db_path,
             start_terminal_id,
             &output.path,
-            config.reference_dir.as_deref(),
+            runtime_reference_dir.as_deref(),
             &airway_reference,
             &rte_seg_path,
         )?;
@@ -106,6 +122,7 @@ fn run() -> Result<()> {
             );
             print_export_stats(&export_stats);
             println!("DEBUG output: {}", output.path.display());
+            println!("DEBUG sample baseline: {}", debug_sample_dir().display());
             if let Some(reference_dir) = &config.reference_dir {
                 println!(
                     "Reference base: {} ({})",
@@ -120,10 +137,13 @@ fn run() -> Result<()> {
     }
 
     if config.debug {
-        let pre_export_subtotal = resolve_paths_time + load_airway_reference_time + validate_db_time;
+        let pre_export_subtotal =
+            resolve_paths_time + load_airway_reference_time + validate_db_time;
+        let total_elapsed = total_start.elapsed().saturating_sub(debug_seed_copy_time);
         println!("\nRun timing:");
         println!(
-            "  Pre-export pipeline: resolve paths {} | load airway reference {} | validate DB {} | subtotal {}",
+            "  Pre-export pipeline: seed output {} | resolve paths {} | load airway reference {} | validate DB {} | subtotal {}",
+            format_duration(debug_seed_copy_time),
             format_duration(resolve_paths_time),
             format_duration(load_airway_reference_time),
             format_duration(validate_db_time),
@@ -144,7 +164,10 @@ fn run() -> Result<()> {
             "  Export wall (all targets): {}",
             format_duration(export_total),
         );
-        println!("  Total elapsed: {}", format_duration(total_start.elapsed()));
+        println!(
+            "  Total elapsed: {}",
+            format_duration(total_elapsed)
+        );
     } else {
         println!("Total elapsed: {}", format_duration(total_start.elapsed()));
     }

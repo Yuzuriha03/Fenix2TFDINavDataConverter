@@ -8,8 +8,7 @@ use rusqlite::params_from_iter;
 use serde_json::{Map, Number, Value};
 
 use crate::db_json::{
-    configure_read_connection, extract_csv_fields_simple, read_text_gbk,
-    trim_csv_field,
+    configure_read_connection, extract_csv_fields_simple, read_text_gbk, trim_csv_field,
 };
 
 use super::{AirwayMirrorReference, directed_airway_route_key};
@@ -37,7 +36,7 @@ impl RteSegDirection {
 }
 
 #[derive(Clone, Debug)]
-struct ParsedRteSegAirwayRow {
+pub(super) struct ParsedRteSegAirwayRow {
     ident: String,
     start_ident: String,
     start_latitude: Option<f64>,
@@ -117,20 +116,17 @@ pub(super) fn load_waypoint_candidates_from_db(
     Ok(candidates)
 }
 
-pub(super) fn load_required_waypoint_idents_from_rte_seg(
-    rte_seg_path: &Path,
-) -> Result<HashSet<String>> {
-    let rows = parse_rte_seg_airway_rows(rte_seg_path)?;
+pub(super) fn collect_required_waypoint_idents(rows: &[ParsedRteSegAirwayRow]) -> HashSet<String> {
     let mut idents = HashSet::new();
     for row in rows {
         if !row.start_ident.trim().is_empty() {
-            idents.insert(row.start_ident);
+            idents.insert(row.start_ident.clone());
         }
         if !row.end_ident.trim().is_empty() {
-            idents.insert(row.end_ident);
+            idents.insert(row.end_ident.clone());
         }
     }
-    Ok(idents)
+    idents
 }
 
 fn resolve_waypoint_longitude_column(conn: &Connection) -> Result<&'static str> {
@@ -156,16 +152,15 @@ fn resolve_waypoint_longitude_column(conn: &Connection) -> Result<&'static str> 
     }
 }
 
-pub(super) fn build_airway_tables_from_rte_seg(
-    rte_seg_path: &Path,
+pub(super) fn build_airway_tables_from_rows(
+    rows: &[ParsedRteSegAirwayRow],
     waypoint_candidates: &HashMap<String, Vec<WaypointCandidate>>,
-) -> Result<AirwayBuildOutput> {
-    let rows = parse_rte_seg_airway_rows(rte_seg_path)?;
+) -> AirwayBuildOutput {
     let mut ident_order = Vec::new();
     let mut segments_by_ident: HashMap<String, Vec<DirectedAirwaySegment>> = HashMap::new();
 
     for row in rows {
-        let Some(segment) = normalize_rte_seg_airway_row(&row, waypoint_candidates) else {
+        let Some(segment) = normalize_rte_seg_airway_row(row, waypoint_candidates) else {
             continue;
         };
         if !segments_by_ident.contains_key(&segment.ident) {
@@ -232,7 +227,7 @@ pub(super) fn build_airway_tables_from_rte_seg(
         }
     }
 
-    Ok((airways, airway_legs))
+    (airways, airway_legs)
 }
 
 pub(super) fn load_rte_seg_mirror_reference(rte_seg_path: &Path) -> Result<AirwayMirrorReference> {
@@ -417,7 +412,7 @@ fn parse_rte_seg_header_indices_simple(line: &str) -> Result<[usize; 4]> {
     ])
 }
 
-fn parse_rte_seg_airway_rows(rte_seg_path: &Path) -> Result<Vec<ParsedRteSegAirwayRow>> {
+pub(super) fn load_rte_seg_airway_rows(rte_seg_path: &Path) -> Result<Vec<ParsedRteSegAirwayRow>> {
     let content = read_text_gbk(rte_seg_path)?;
     parse_rte_seg_airway_rows_from_bufread(Cursor::new(content))
 }

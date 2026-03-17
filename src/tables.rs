@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -11,8 +11,8 @@ use rusqlite::Connection;
 use serde_json::{Map, Value};
 
 use crate::db_json::{
-    configure_read_connection, fetch_table_rows, fetch_table_rows_after_id, format_row, json_to_i64,
-    write_json_objects,
+    configure_read_connection, fetch_table_rows, fetch_table_rows_after_id, format_row,
+    json_to_i64, write_json_objects,
 };
 use crate::stats::{PhaseDurations, TableExportStats, TableTimingBreakdown};
 
@@ -126,8 +126,12 @@ fn load_existing_id_index(
         return Ok(None);
     }
 
-    let bytes = fs::read(&base_json_path)
-        .with_context(|| format!("failed to read reference json: {}", base_json_path.display()))?;
+    let bytes = fs::read(&base_json_path).with_context(|| {
+        format!(
+            "failed to read reference json: {}",
+            base_json_path.display()
+        )
+    })?;
     let (existing_ids, row_count) = scan_json_id_index(&bytes);
 
     Ok(Some(ExistingJsonIndex {
@@ -197,19 +201,23 @@ fn write_json_append_from_base(
     appended_rows: &[Map<String, Value>],
 ) -> Result<()> {
     if appended_rows.is_empty() {
-        fs::copy(base_json_path, output_path).with_context(|| {
-            format!(
-                "failed to copy reference json from {} to {}",
-                base_json_path.display(),
-                output_path.display()
-            )
-        })?;
+        if base_json_path == output_path {
+            return Ok(());
+        }
+        copy_json_bytes(base_json_path, output_path)?;
         return Ok(());
     }
 
-    let base_bytes = fs::read(base_json_path)
-        .with_context(|| format!("failed to read reference json: {}", base_json_path.display()))?;
-    let Some(last_non_ws) = base_bytes.iter().rposition(|byte| !byte.is_ascii_whitespace()) else {
+    let base_bytes = fs::read(base_json_path).with_context(|| {
+        format!(
+            "failed to read reference json: {}",
+            base_json_path.display()
+        )
+    })?;
+    let Some(last_non_ws) = base_bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+    else {
         anyhow::bail!("reference json is empty: {}", base_json_path.display());
     };
     if base_bytes[last_non_ws] != b']' {
@@ -219,7 +227,10 @@ fn write_json_append_from_base(
         );
     }
 
-    let Some(first_non_ws) = base_bytes.iter().position(|byte| !byte.is_ascii_whitespace()) else {
+    let Some(first_non_ws) = base_bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+    else {
         anyhow::bail!("reference json is empty: {}", base_json_path.display());
     };
     if base_bytes[first_non_ws] != b'[' {
@@ -233,8 +244,12 @@ fn write_json_append_from_base(
         .iter()
         .any(|byte| !byte.is_ascii_whitespace());
 
-    let appended_bytes = serde_json::to_vec(appended_rows)
-        .with_context(|| format!("failed to encode appended rows for {}", output_path.display()))?;
+    let appended_bytes = serde_json::to_vec(appended_rows).with_context(|| {
+        format!(
+            "failed to encode appended rows for {}",
+            output_path.display()
+        )
+    })?;
     let appended_last_non_ws = appended_bytes
         .iter()
         .rposition(|byte| !byte.is_ascii_whitespace())
@@ -255,26 +270,62 @@ fn write_json_append_from_base(
     let mut writer = BufWriter::with_capacity(1024 * 1024, output_file);
     writer
         .write_all(&base_bytes[..last_non_ws])
-        .with_context(|| format!("failed to write merged json prefix: {}", output_path.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to write merged json prefix: {}",
+                output_path.display()
+            )
+        })?;
     if !appended_inner.is_empty() {
         if has_existing_items {
-            writer
-                .write_all(b",")
-                .with_context(|| format!("failed to write merged json delimiter: {}", output_path.display()))?;
+            writer.write_all(b",").with_context(|| {
+                format!(
+                    "failed to write merged json delimiter: {}",
+                    output_path.display()
+                )
+            })?;
         }
-        writer
-            .write_all(appended_inner)
-            .with_context(|| format!("failed to write merged json body: {}", output_path.display()))?;
+        writer.write_all(appended_inner).with_context(|| {
+            format!(
+                "failed to write merged json body: {}",
+                output_path.display()
+            )
+        })?;
     }
     writer
         .write_all(b"]")
         .with_context(|| format!("failed to finalize merged json: {}", output_path.display()))?;
     writer
         .write_all(&base_bytes[last_non_ws + 1..])
-        .with_context(|| format!("failed to write merged json suffix: {}", output_path.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to write merged json suffix: {}",
+                output_path.display()
+            )
+        })?;
     writer
         .flush()
         .with_context(|| format!("failed to flush merged json: {}", output_path.display()))?;
 
+    Ok(())
+}
+
+fn copy_json_bytes(source_path: &Path, output_path: &Path) -> Result<()> {
+    let source = File::open(source_path)
+        .with_context(|| format!("failed to open reference json: {}", source_path.display()))?;
+    let output = File::create(output_path)
+        .with_context(|| format!("failed to create output json: {}", output_path.display()))?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, source);
+    let mut writer = BufWriter::with_capacity(1024 * 1024, output);
+    std::io::copy(&mut reader, &mut writer).with_context(|| {
+        format!(
+            "failed to copy reference json from {} to {}",
+            source_path.display(),
+            output_path.display()
+        )
+    })?;
+    writer
+        .flush()
+        .with_context(|| format!("failed to flush output json: {}", output_path.display()))?;
     Ok(())
 }

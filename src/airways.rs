@@ -2,6 +2,8 @@ mod merge;
 mod rte_seg;
 
 use std::collections::HashSet;
+use std::fs::File;
+use std::io::BufReader;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -10,7 +12,7 @@ use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::{Map, Number, Value};
 
-use crate::db_json::{read_json_object_array, write_json_objects};
+use crate::db_json::write_json_objects;
 use crate::stats::{AirwayTimingBreakdown, PhaseDurations, TableExportStats};
 
 #[derive(Clone, Debug, Default)]
@@ -33,9 +35,26 @@ impl AirwayMirrorReference {
 
 #[derive(Clone, Debug)]
 pub(crate) struct AirwayReferenceData {
-    pub(super) airways: Vec<Map<String, Value>>,
+    pub(super) airways: Vec<AirwayReferenceRow>,
     pub(super) airway_legs: Vec<AirwayLegReferenceRow>,
     pub(super) mirror_reference: AirwayMirrorReference,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct AirwayReferenceRow {
+    #[serde(rename = "ID")]
+    pub(super) id: i64,
+    #[serde(rename = "Ident")]
+    pub(super) ident: String,
+}
+
+impl AirwayReferenceRow {
+    pub(super) fn to_map(&self) -> Map<String, Value> {
+        let mut row = Map::with_capacity(2);
+        row.insert("ID".to_string(), Value::Number(Number::from(self.id)));
+        row.insert("Ident".to_string(), Value::String(self.ident.clone()));
+        row
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -89,9 +108,20 @@ impl AirwayLegReferenceRow {
             "IsStart".to_string(),
             Value::Number(Number::from(self.is_start)),
         );
-        row.insert("IsEnd".to_string(), Value::Number(Number::from(self.is_end)));
+        row.insert(
+            "IsEnd".to_string(),
+            Value::Number(Number::from(self.is_end)),
+        );
         row
     }
+}
+
+fn load_airways_reference(path: &Path) -> Result<Vec<AirwayReferenceRow>> {
+    let file = File::open(path)
+        .with_context(|| format!("failed to open json file: {}", path.display()))?;
+    let reader = BufReader::with_capacity(1024 * 1024, file);
+    serde_json::from_reader(reader)
+        .with_context(|| format!("failed to parse airway reference json: {}", path.display()))
 }
 
 fn load_airway_legs_reference(path: &Path) -> Result<Vec<AirwayLegReferenceRow>> {
@@ -106,7 +136,9 @@ fn load_airway_legs_reference(path: &Path) -> Result<Vec<AirwayLegReferenceRow>>
         .map(|chunk| {
             let mut rows = Vec::with_capacity(chunk.len());
             for &(start, end) in chunk {
-                rows.push(serde_json::from_slice::<AirwayLegReferenceRow>(&bytes[start..end])?);
+                rows.push(serde_json::from_slice::<AirwayLegReferenceRow>(
+                    &bytes[start..end],
+                )?);
             }
             Ok(rows)
         })
@@ -217,13 +249,14 @@ pub(crate) fn export_airway_tables(
     let airway_db_read_time = Default::default();
 
     let waypoint_candidate_start = Instant::now();
-    let required_idents = rte_seg::load_required_waypoint_idents_from_rte_seg(rte_seg_path)?;
+    let rte_seg_rows = rte_seg::load_rte_seg_airway_rows(rte_seg_path)?;
+    let required_idents = rte_seg::collect_required_waypoint_idents(&rte_seg_rows);
     let waypoint_candidates = rte_seg::load_waypoint_candidates_from_db(db_path, &required_idents)?;
     let waypoint_candidates_load = waypoint_candidate_start.elapsed();
 
     let airway_transform_start = Instant::now();
     let (formatted_airways, formatted_legs) =
-        rte_seg::build_airway_tables_from_rte_seg(rte_seg_path, &waypoint_candidates)?;
+        rte_seg::build_airway_tables_from_rows(&rte_seg_rows, &waypoint_candidates);
     let airway_transform_time = airway_transform_start.elapsed();
 
     let airway_leg_transform_start = Instant::now();
@@ -303,7 +336,7 @@ pub(crate) fn load_airway_reference(
     }
 
     let airways_start = Instant::now();
-    let airways = read_json_object_array(&airways_path)?;
+    let airways = load_airways_reference(&airways_path)?;
     timing.airways_json = airways_start.elapsed();
 
     let airway_legs_start = Instant::now();

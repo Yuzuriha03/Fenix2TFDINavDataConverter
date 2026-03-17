@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Number, Value};
 
-use crate::db_json::{json_text, json_to_i64};
+use crate::db_json::json_to_i64;
 
-use super::{AirwayLegReferenceRow, AirwayReferenceData};
+use super::{AirwayLegReferenceRow, AirwayReferenceData, AirwayReferenceRow};
 
 type AirwayRows = Vec<Map<String, Value>>;
 type AirwayMergeOutput = (AirwayRows, AirwayRows);
@@ -60,22 +60,38 @@ impl Chain {
     }
 }
 
+fn row_text<'a>(row: &'a Map<String, Value>, key: &str) -> &'a str {
+    row.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("")
+}
+
+fn directed_edge(level: &str, from: &str, to: &str) -> DirectedEdge {
+    DirectedEdge {
+        level: level.to_string(),
+        from: from.to_string(),
+        to: to.to_string(),
+    }
+}
+
 pub(super) fn merge_airway_outputs(
     source_airways: &[Map<String, Value>],
     source_legs: &[Map<String, Value>],
     airway_reference: &AirwayReferenceData,
 ) -> AirwayMergeOutput {
     let source_ident_by_id = build_airway_ident_map(source_airways);
-    let reference_ident_by_id = build_airway_ident_map(&airway_reference.airways);
+    let reference_ident_by_id = build_reference_airway_ident_map(&airway_reference.airways);
 
     let source_airway_by_ident = build_airway_row_map_by_ident(source_airways);
-    let mut final_airway_by_ident = build_airway_row_map_by_ident(&airway_reference.airways);
+    let mut final_airway_by_ident =
+        build_reference_airway_row_map_by_ident(&airway_reference.airways);
 
     let source_legs_by_ident = group_airway_legs_by_ident(source_legs, &source_ident_by_id);
     let mut final_legs_by_ident =
         group_reference_airway_legs_by_ident(&airway_reference.airway_legs, &reference_ident_by_id);
 
-    let mut next_airway_id = next_id_from_rows(&airway_reference.airways, "ID");
+    let mut next_airway_id = next_reference_airway_id(&airway_reference.airways);
     let mut next_leg_id = airway_reference
         .airway_legs
         .iter()
@@ -157,14 +173,6 @@ pub(super) fn merge_airway_outputs(
     (final_airways, final_legs)
 }
 
-fn next_id_from_rows(rows: &[Map<String, Value>], id_col: &str) -> i64 {
-    rows.iter()
-        .filter_map(|row| json_to_i64(row.get(id_col)))
-        .max()
-        .unwrap_or(0)
-        + 1
-}
-
 fn ensure_airway_row(
     ident: &str,
     source_airway_by_ident: &HashMap<String, Map<String, Value>>,
@@ -183,7 +191,10 @@ fn ensure_airway_row(
             fallback.insert("Ident".to_string(), Value::String(ident.to_string()));
             fallback
         });
-    row.insert("ID".to_string(), Value::Number(Number::from(*next_airway_id)));
+    row.insert(
+        "ID".to_string(),
+        Value::Number(Number::from(*next_airway_id)),
+    );
     *next_airway_id += 1;
     final_airway_by_ident.insert(ident.to_string(), row.clone());
     row
@@ -199,13 +210,31 @@ fn build_airway_ident_map(rows: &[Map<String, Value>]) -> HashMap<i64, String> {
         .collect()
 }
 
-fn build_airway_row_map_by_ident(rows: &[Map<String, Value>]) -> HashMap<String, Map<String, Value>> {
+fn build_reference_airway_ident_map(rows: &[AirwayReferenceRow]) -> HashMap<i64, String> {
+    rows.iter().map(|row| (row.id, row.ident.clone())).collect()
+}
+
+fn build_airway_row_map_by_ident(
+    rows: &[Map<String, Value>],
+) -> HashMap<String, Map<String, Value>> {
     rows.iter()
         .filter_map(|row| {
             let ident = row.get("Ident")?.as_str()?.to_string();
             Some((ident, row.clone()))
         })
         .collect()
+}
+
+fn build_reference_airway_row_map_by_ident(
+    rows: &[AirwayReferenceRow],
+) -> HashMap<String, Map<String, Value>> {
+    rows.iter()
+        .map(|row| (row.ident.clone(), row.to_map()))
+        .collect()
+}
+
+fn next_reference_airway_id(rows: &[AirwayReferenceRow]) -> i64 {
+    rows.iter().map(|row| row.id).max().unwrap_or(0) + 1
 }
 
 fn group_airway_legs_by_ident(
@@ -245,13 +274,13 @@ fn has_connection(source_chains: &[Chain], existing_legs: &[Map<String, Value>])
     }
 
     for row in existing_legs {
-        let from = json_text(row.get("Waypoint1"));
-        let to = json_text(row.get("Waypoint2"));
+        let from = row_text(row, "Waypoint1");
+        let to = row_text(row, "Waypoint2");
         if from.is_empty() || to.is_empty() {
             continue;
         }
         for chain in source_chains {
-            if let Some(distance) = path_distance(chain, &from, &to)
+            if let Some(distance) = path_distance(chain, from, to)
                 && distance >= 1
             {
                 return true;
@@ -280,8 +309,8 @@ fn extract_chains(rows: &[Map<String, Value>]) -> Vec<Chain> {
 
     if is_sorted_by_id {
         for row in rows {
-            let from = json_text(row.get("Waypoint1"));
-            let to = json_text(row.get("Waypoint2"));
+            let from = row_text(row, "Waypoint1");
+            let to = row_text(row, "Waypoint2");
             if from.is_empty() || to.is_empty() {
                 continue;
             }
@@ -291,16 +320,16 @@ fn extract_chains(rows: &[Map<String, Value>]) -> Vec<Chain> {
                 if current_points.len() >= 2 {
                     chains.push(Chain::from_points(std::mem::take(&mut current_points)));
                 }
-                current_points.push(from.clone());
-                current_points.push(to.clone());
+                current_points.push(from.to_string());
+                current_points.push(to.to_string());
             } else {
-                if current_points.last().map(|p| p.as_str()) != Some(from.as_str()) {
+                if current_points.last().map(|p| p.as_str()) != Some(from) {
                     if current_points.len() >= 2 {
                         chains.push(Chain::from_points(std::mem::take(&mut current_points)));
                     }
-                    current_points.push(from.clone());
+                    current_points.push(from.to_string());
                 }
-                current_points.push(to.clone());
+                current_points.push(to.to_string());
             }
 
             let is_end = json_to_i64(row.get("IsEnd")) == Some(1);
@@ -316,8 +345,8 @@ fn extract_chains(rows: &[Map<String, Value>]) -> Vec<Chain> {
         let mut sorted_rows_storage = rows.to_vec();
         sorted_rows_storage.sort_by_key(|row| json_to_i64(row.get("ID")).unwrap_or(i64::MAX));
         for row in &sorted_rows_storage {
-            let from = json_text(row.get("Waypoint1"));
-            let to = json_text(row.get("Waypoint2"));
+            let from = row_text(row, "Waypoint1");
+            let to = row_text(row, "Waypoint2");
             if from.is_empty() || to.is_empty() {
                 continue;
             }
@@ -327,16 +356,16 @@ fn extract_chains(rows: &[Map<String, Value>]) -> Vec<Chain> {
                 if current_points.len() >= 2 {
                     chains.push(Chain::from_points(std::mem::take(&mut current_points)));
                 }
-                current_points.push(from.clone());
-                current_points.push(to.clone());
+                current_points.push(from.to_string());
+                current_points.push(to.to_string());
             } else {
-                if current_points.last().map(|p| p.as_str()) != Some(from.as_str()) {
+                if current_points.last().map(|p| p.as_str()) != Some(from) {
                     if current_points.len() >= 2 {
                         chains.push(Chain::from_points(std::mem::take(&mut current_points)));
                     }
-                    current_points.push(from.clone());
+                    current_points.push(from.to_string());
                 }
-                current_points.push(to.clone());
+                current_points.push(to.to_string());
             }
 
             let is_end = json_to_i64(row.get("IsEnd")) == Some(1);
@@ -366,28 +395,23 @@ fn build_expected_directionality(
     let mut undirected = HashSet::new();
 
     for row in rows {
-        let level = json_text(row.get("Level"));
-        let from = json_text(row.get("Waypoint1"));
-        let to = json_text(row.get("Waypoint2"));
+        let level = row_text(row, "Level");
+        let from = row_text(row, "Waypoint1");
+        let to = row_text(row, "Waypoint2");
         if from.is_empty() || to.is_empty() {
             continue;
         }
-        directed.insert(DirectedEdge {
-            level: level.clone(),
-            from: from.clone(),
-            to: to.clone(),
-        });
-        if mirror_reference.should_mirror(ident, &level, &from, &to) {
-            directed.insert(DirectedEdge {
-                level: level.clone(),
-                from: to.clone(),
-                to: from.clone(),
-            });
+        directed.insert(directed_edge(level, from, to));
+        if mirror_reference.should_mirror(ident, level, from, to) {
+            directed.insert(directed_edge(level, to, from));
         }
-        undirected.insert(undirected_edge(&level, &from, &to));
+        undirected.insert(undirected_edge(level, from, to));
     }
 
-    SourceDirectionality { directed, undirected }
+    SourceDirectionality {
+        directed,
+        undirected,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -405,14 +429,14 @@ fn merge_with_insertion_strategy(
 
     let mut merged = Vec::new();
     for row in existing_legs {
-        let from = json_text(row.get("Waypoint1"));
-        let to = json_text(row.get("Waypoint2"));
+        let from = row_text(row, "Waypoint1");
+        let to = row_text(row, "Waypoint2");
         if from.is_empty() || to.is_empty() {
             merged.push(clone_leg_with_new_id(row, airway_id, next_leg_id));
             continue;
         }
 
-        let insert_path = find_insert_path(&from, &to, source_chains);
+        let insert_path = find_insert_path(from, to, source_chains);
         if let Some(points) = insert_path
             && points.len() > 2
         {
@@ -435,25 +459,20 @@ fn merge_with_insertion_strategy(
 
     let mut seen = build_directed_set(&merged);
     for row in source_legs {
-        let level = json_text(row.get("Level"));
-        let from = json_text(row.get("Waypoint1"));
-        let to = json_text(row.get("Waypoint2"));
+        let level = row_text(row, "Level");
+        let from = row_text(row, "Waypoint1");
+        let to = row_text(row, "Waypoint2");
         if from.is_empty() || to.is_empty() {
             continue;
         }
-        let edge = DirectedEdge {
-            level,
-            from,
-            to,
-        };
+        let edge = directed_edge(level, from, to);
         if seen.insert(edge) {
             merged.push(clone_leg_with_new_id(row, airway_id, next_leg_id));
         }
     }
 
-    let mirrored = apply_mirror_rows(ident, merged, mirror_reference, next_leg_id);
-    let mirrored = reconcile_directionality(mirrored, source_directionality);
-    dedup_directed(mirrored)
+    let mirrored = apply_mirror_rows(ident, merged, &mut seen, mirror_reference, next_leg_id);
+    reconcile_and_dedup_directionality(mirrored, source_directionality)
 }
 
 fn build_independent_append(
@@ -469,48 +488,39 @@ fn build_independent_append(
         .map(|row| clone_leg_with_new_id(row, airway_id, next_leg_id))
         .collect();
 
+    let mut seen = build_directed_set(&rows);
     rows = apply_mirror_rows(
         ident,
         rows,
+        &mut seen,
         &airway_reference.mirror_reference,
         next_leg_id,
     );
-    rows = reconcile_directionality(rows, source_directionality);
-    dedup_directed(rows)
+    reconcile_and_dedup_directionality(rows, source_directionality)
 }
 
 fn apply_mirror_rows(
     ident: &str,
     mut rows: Vec<Map<String, Value>>,
+    existing_directed: &mut HashSet<DirectedEdge>,
     mirror_reference: &super::AirwayMirrorReference,
     next_leg_id: &mut i64,
 ) -> Vec<Map<String, Value>> {
-    let mut existing_directed = HashSet::new();
-    for row in &rows {
-        if let Some(edge) = directed_edge_from_row(row) {
-            existing_directed.insert(edge);
-        }
-    }
-
     let original_len = rows.len();
     for idx in (0..original_len).rev() {
         let row = rows[idx].clone();
-        let level = json_text(row.get("Level"));
-        let from = json_text(row.get("Waypoint1"));
-        let to = json_text(row.get("Waypoint2"));
+        let level = row_text(&row, "Level");
+        let from = row_text(&row, "Waypoint1");
+        let to = row_text(&row, "Waypoint2");
         if from.is_empty() || to.is_empty() {
             continue;
         }
 
-        if !mirror_reference.should_mirror(ident, &level, &from, &to) {
+        if !mirror_reference.should_mirror(ident, level, from, to) {
             continue;
         }
 
-        let reverse = DirectedEdge {
-            level,
-            from: to.clone(),
-            to: from.clone(),
-        };
+        let reverse = directed_edge(level, to, from);
         if existing_directed.contains(&reverse) {
             continue;
         }
@@ -580,18 +590,21 @@ fn build_template_lookup(
     let mut map = HashMap::new();
 
     for row in source_legs.iter().chain(existing_legs.iter()) {
-        let from = json_text(row.get("Waypoint1"));
-        let to = json_text(row.get("Waypoint2"));
+        let from = row_text(row, "Waypoint1");
+        let to = row_text(row, "Waypoint2");
         if from.is_empty() || to.is_empty() {
             continue;
         }
 
-        map.entry(undirected_pair(&from, &to))
+        map.entry(undirected_pair(from, to))
             .or_insert_with(|| SegmentTemplate {
-                level: row.get("Level").cloned().unwrap_or(Value::String("B".to_string())),
+                level: row
+                    .get("Level")
+                    .cloned()
+                    .unwrap_or(Value::String("B".to_string())),
                 from_id: row.get("Waypoint1ID").cloned().unwrap_or(Value::Null),
                 to_id: row.get("Waypoint2ID").cloned().unwrap_or(Value::Null),
-                from_name: from,
+                from_name: from.to_string(),
             });
     }
 
@@ -629,7 +642,10 @@ fn build_rows_from_points(
         let mut row = Map::new();
         row.insert("ID".to_string(), Value::Number(Number::from(*next_leg_id)));
         *next_leg_id += 1;
-        row.insert("AirwayID".to_string(), Value::Number(Number::from(airway_id)));
+        row.insert(
+            "AirwayID".to_string(),
+            Value::Number(Number::from(airway_id)),
+        );
         row.insert("Level".to_string(), template.level.clone());
 
         let oriented_same = template.from_name == *from;
@@ -647,7 +663,11 @@ fn build_rows_from_points(
         );
         row.insert(
             "IsEnd".to_string(),
-            Value::Number(Number::from(if idx + 1 == points.len() - 1 && mark_end { 1 } else { 0 })),
+            Value::Number(Number::from(if idx + 1 == points.len() - 1 && mark_end {
+                1
+            } else {
+                0
+            })),
         );
         row.insert("Waypoint1".to_string(), Value::String(from.clone()));
         row.insert("Waypoint2".to_string(), Value::String(to.clone()));
@@ -657,33 +677,32 @@ fn build_rows_from_points(
     built
 }
 
-fn reconcile_directionality(
+fn reconcile_and_dedup_directionality(
     rows: Vec<Map<String, Value>>,
     source_directionality: &SourceDirectionality,
 ) -> Vec<Map<String, Value>> {
-    rows.into_iter()
-        .filter_map(|mut row| {
-            let level = json_text(row.get("Level"));
-            let from = json_text(row.get("Waypoint1"));
-            let to = json_text(row.get("Waypoint2"));
-            if from.is_empty() || to.is_empty() {
-                return Some(row);
-            }
+    let mut index_by_edge: HashMap<DirectedEdge, usize> = HashMap::new();
+    let mut deduped: Vec<Map<String, Value>> = Vec::with_capacity(rows.len());
 
-            let undirected = undirected_edge(&level, &from, &to);
-            if !source_directionality.undirected.contains(&undirected) {
-                return Some(row);
-            }
+    for mut row in rows {
+        let level = row_text(&row, "Level").to_string();
+        let from = row_text(&row, "Waypoint1").to_string();
+        let to = row_text(&row, "Waypoint2").to_string();
+        if from.is_empty() || to.is_empty() {
+            deduped.push(row);
+            continue;
+        }
 
-            let edge = DirectedEdge {
-                level: level.clone(),
-                from: from.clone(),
-                to: to.clone(),
-            };
-            if source_directionality.directed.contains(&edge) {
-                return Some(row);
-            }
+        let mut edge = DirectedEdge {
+            level: level.clone(),
+            from: from.clone(),
+            to: to.clone(),
+        };
 
+        let undirected = undirected_edge(&level, &from, &to);
+        if source_directionality.undirected.contains(&undirected)
+            && !source_directionality.directed.contains(&edge)
+        {
             let reverse = DirectedEdge {
                 level,
                 from: to,
@@ -693,31 +712,11 @@ fn reconcile_directionality(
                 swap(&mut row, "Waypoint1ID", "Waypoint2ID");
                 swap(&mut row, "Waypoint1", "Waypoint2");
                 swap(&mut row, "IsStart", "IsEnd");
-                return Some(row);
+                edge = reverse;
+            } else {
+                continue;
             }
-
-            None
-        })
-        .collect()
-}
-
-fn clone_leg_with_new_id(row: &Map<String, Value>, airway_id: i64, next_leg_id: &mut i64) -> Map<String, Value> {
-    let mut cloned = row.clone();
-    cloned.insert("ID".to_string(), Value::Number(Number::from(*next_leg_id)));
-    *next_leg_id += 1;
-    cloned.insert("AirwayID".to_string(), Value::Number(Number::from(airway_id)));
-    cloned
-}
-
-fn dedup_directed(rows: Vec<Map<String, Value>>) -> Vec<Map<String, Value>> {
-    let mut index_by_edge: HashMap<DirectedEdge, usize> = HashMap::new();
-    let mut deduped: Vec<Map<String, Value>> = Vec::new();
-
-    for row in rows {
-        let Some(edge) = directed_edge_from_row(&row) else {
-            deduped.push(row);
-            continue;
-        };
+        }
 
         if let Some(index) = index_by_edge.get(&edge).copied() {
             let existing = &mut deduped[index];
@@ -741,14 +740,29 @@ fn dedup_directed(rows: Vec<Map<String, Value>>) -> Vec<Map<String, Value>> {
     deduped
 }
 
+fn clone_leg_with_new_id(
+    row: &Map<String, Value>,
+    airway_id: i64,
+    next_leg_id: &mut i64,
+) -> Map<String, Value> {
+    let mut cloned = row.clone();
+    cloned.insert("ID".to_string(), Value::Number(Number::from(*next_leg_id)));
+    *next_leg_id += 1;
+    cloned.insert(
+        "AirwayID".to_string(),
+        Value::Number(Number::from(airway_id)),
+    );
+    cloned
+}
+
 fn directed_edge_from_row(row: &Map<String, Value>) -> Option<DirectedEdge> {
-    let level = json_text(row.get("Level"));
-    let from = json_text(row.get("Waypoint1"));
-    let to = json_text(row.get("Waypoint2"));
+    let level = row_text(row, "Level");
+    let from = row_text(row, "Waypoint1");
+    let to = row_text(row, "Waypoint2");
     if from.is_empty() || to.is_empty() {
         return None;
     }
-    Some(DirectedEdge { level, from, to })
+    Some(directed_edge(level, from, to))
 }
 
 fn build_directed_set(rows: &[Map<String, Value>]) -> HashSet<DirectedEdge> {
@@ -824,6 +838,9 @@ fn renumber_airways_and_legs(airways: &mut [Map<String, Value>], legs: &mut [Map
     });
 
     for (idx, row) in legs.iter_mut().enumerate() {
-        row.insert("ID".to_string(), Value::Number(Number::from(idx as i64 + 1)));
+        row.insert(
+            "ID".to_string(),
+            Value::Number(Number::from(idx as i64 + 1)),
+        );
     }
 }

@@ -10,6 +10,8 @@ use rusqlite::params;
 use rusqlite::types::Value as SqlValue;
 use serde_json::{Map, Number, Value};
 
+const DEFAULT_JSON_WRITE_BUFFER_CAPACITY: usize = 1024 * 1024;
+
 pub(crate) fn configure_read_connection(conn: &Connection) {
     // Best-effort read tuning; ignore unsupported pragmas on some SQLite builds.
     let _ = conn.pragma_update(None, "cache_size", -200_000i64);
@@ -53,7 +55,9 @@ pub(crate) fn fetch_table_rows_after_id(
         .map(|name| name.to_string())
         .collect();
     let rows = statement
-        .query_map(params![min_exclusive_id], |row| row_to_map(row, &column_names))
+        .query_map(params![min_exclusive_id], |row| {
+            row_to_map(row, &column_names)
+        })
         .with_context(|| format!("failed to iterate table {table_name} incrementally"))?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .with_context(|| format!("failed to read incremental rows from table {table_name}"))
@@ -66,12 +70,14 @@ fn table_select_sql(conn: &Connection, table_name: &str) -> Result<String> {
             Ok("SELECT Ident, Type, Country, NavKeyCode, ID FROM NavaidLookup".to_string())
         }
         "WaypointLookup" => Ok("SELECT Ident, Country, ID FROM WaypointLookup".to_string()),
-        "Terminals" => {
-            Ok("SELECT ID, AirportID, Proc, ICAO, FullName, Name, Rwy, RwyID FROM Terminals".to_string())
-        }
-        "AirwayLegs" => {
-            Ok("SELECT ID, AirwayID, Level, Waypoint1ID, Waypoint2ID, IsStart, IsEnd FROM AirwayLegs".to_string())
-        }
+        "Terminals" => Ok(
+            "SELECT ID, AirportID, Proc, ICAO, FullName, Name, Rwy, RwyID FROM Terminals"
+                .to_string(),
+        ),
+        "AirwayLegs" => Ok(
+            "SELECT ID, AirwayID, Level, Waypoint1ID, Waypoint2ID, IsStart, IsEnd FROM AirwayLegs"
+                .to_string(),
+        ),
         "Waypoints" => {
             let longitude_col = resolve_longitude_column(conn, "Waypoints")?;
             Ok(format!(
@@ -99,7 +105,8 @@ fn resolve_longitude_column(conn: &Connection, table_name: &str) -> Result<&'sta
     let mut has_longitude = false;
     let mut has_longtitude = false;
     for row in rows {
-        let name = row.with_context(|| format!("failed to read schema row for table {table_name}"))?;
+        let name =
+            row.with_context(|| format!("failed to read schema row for table {table_name}"))?;
         if name == "Longitude" {
             has_longitude = true;
         }
@@ -253,25 +260,33 @@ pub(crate) fn json_to_i64(value: Option<&Value>) -> Option<i64> {
     }
 }
 
-pub(crate) fn json_text(value: Option<&Value>) -> String {
-    match value {
-        Some(Value::String(text)) => text.trim().to_string(),
-        Some(Value::Number(number)) => number.to_string(),
-        Some(Value::Bool(flag)) => flag.to_string(),
-        _ => String::new(),
-    }
+pub(crate) fn write_json_objects(path: &Path, rows: &[Map<String, Value>]) -> Result<()> {
+    write_json_objects_with_buffer(path, rows, DEFAULT_JSON_WRITE_BUFFER_CAPACITY)
 }
 
-pub(crate) fn write_json_objects(path: &Path, rows: &[Map<String, Value>]) -> Result<()> {
+pub(crate) fn write_json_objects_with_buffer(
+    path: &Path,
+    rows: &[Map<String, Value>],
+    buffer_capacity: usize,
+) -> Result<()> {
     let file =
         File::create(path).with_context(|| format!("failed to create file: {}", path.display()))?;
-    let writer = BufWriter::with_capacity(1024 * 1024, file);
+    let writer = BufWriter::with_capacity(buffer_capacity, file);
     serde_json::to_writer(writer, rows)
         .with_context(|| format!("failed to write json objects: {}", path.display()))?;
     Ok(())
 }
 
-pub(crate) fn write_json_objects_if_changed(path: &Path, rows: &[Map<String, Value>]) -> Result<bool> {
+pub(crate) fn write_json_objects_if_changed_with_buffer(
+    path: &Path,
+    rows: &[Map<String, Value>],
+    buffer_capacity: usize,
+) -> Result<bool> {
+    if !path.exists() {
+        write_json_objects_with_buffer(path, rows, buffer_capacity)?;
+        return Ok(true);
+    }
+
     let encoded = serde_json::to_vec(rows)
         .with_context(|| format!("failed to encode json objects: {}", path.display()))?;
 
@@ -291,13 +306,6 @@ pub(crate) fn read_text_gbk(path: &Path) -> Result<String> {
         fs::read(path).with_context(|| format!("failed to read file: {}", path.display()))?;
     let (decoded, _, _) = GBK.decode(&bytes);
     Ok(decoded.into_owned())
-}
-
-pub(crate) fn read_json_object_array(path: &Path) -> Result<Vec<Map<String, Value>>> {
-    let file = File::open(path)
-        .with_context(|| format!("failed to open json file: {}", path.display()))?;
-    serde_json::from_reader(file)
-        .with_context(|| format!("failed to parse json object array: {}", path.display()))
 }
 
 pub(crate) fn trim_csv_field(field: &str) -> &str {
