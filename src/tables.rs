@@ -1,13 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use rusqlite::Connection;
 use serde_json::{Map, Value};
 
 use crate::db_json::{
-    fetch_table_rows, format_row, json_to_i64, read_json_object_array, write_json_objects,
+    configure_read_connection, fetch_table_rows, format_row, json_to_i64, read_json_object_array,
+    write_json_objects,
 };
 use crate::stats::{PhaseDurations, TableExportStats};
 
@@ -20,15 +22,33 @@ pub(crate) fn export_table_to_json(
 ) -> Result<TableExportStats> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("failed to open database: {}", db_path.display()))?;
+    configure_read_connection(&conn);
     let db_read_start = Instant::now();
     let rows = fetch_table_rows(&conn, table_name)?;
     let db_read_time = db_read_start.elapsed();
+
+    let existing_merge = load_existing_rows_and_ids(base_json_dir, table_name)?;
     let json_transform_start = Instant::now();
-    let formatted_rows: Vec<Map<String, Value>> = rows
-        .into_iter()
-        .map(|row| format_row(row, table_name, waypoints))
-        .collect();
-    let merged_rows = merge_rows_by_id(base_json_dir, table_name, formatted_rows)?;
+    let formatted_rows: Vec<Map<String, Value>> = if let Some((_, existing_ids)) = &existing_merge {
+        rows.into_par_iter()
+            .filter_map(|row| {
+                let keep_row = json_to_i64(row.get("ID"))
+                    .map(|id| !existing_ids.contains(&id))
+                    .unwrap_or(true);
+                keep_row.then(|| format_row(row, table_name, waypoints))
+            })
+            .collect()
+    } else {
+        rows.into_par_iter()
+            .map(|row| format_row(row, table_name, waypoints))
+            .collect()
+    };
+    let merged_rows = if let Some((mut existing_rows, _)) = existing_merge {
+        existing_rows.extend(formatted_rows);
+        existing_rows
+    } else {
+        formatted_rows
+    };
     let json_transform_time = json_transform_start.elapsed();
 
     let output_path = output_dir.join(format!("{table_name}.json"));
@@ -59,35 +79,24 @@ pub(crate) fn fetch_waypoints(conn: &Connection) -> Result<HashMap<i64, String>>
         .context("failed to build Waypoints lookup")
 }
 
-fn merge_rows_by_id(
+fn load_existing_rows_and_ids(
     base_json_dir: Option<&Path>,
     table_name: &str,
-    formatted_rows: Vec<Map<String, Value>>,
-) -> Result<Vec<Map<String, Value>>> {
+) -> Result<Option<(Vec<Map<String, Value>>, HashSet<i64>)>> {
     let Some(base_json_dir) = base_json_dir else {
-        return Ok(formatted_rows);
+        return Ok(None);
     };
 
     let base_json_path = base_json_dir.join(format!("{table_name}.json"));
     if !base_json_path.exists() {
-        return Ok(formatted_rows);
+        return Ok(None);
     }
 
-    let mut existing_rows = read_json_object_array(&base_json_path)?;
-    let mut existing_ids = existing_rows
+    let existing_rows = read_json_object_array(&base_json_path)?;
+    let existing_ids = existing_rows
         .iter()
         .filter_map(|row| json_to_i64(row.get("ID")))
-        .collect::<std::collections::HashSet<_>>();
+        .collect::<HashSet<_>>();
 
-    for row in formatted_rows {
-        let Some(id) = json_to_i64(row.get("ID")) else {
-            existing_rows.push(row);
-            continue;
-        };
-        if existing_ids.insert(id) {
-            existing_rows.push(row);
-        }
-    }
-
-    Ok(existing_rows)
+    Ok(Some((existing_rows, existing_ids)))
 }

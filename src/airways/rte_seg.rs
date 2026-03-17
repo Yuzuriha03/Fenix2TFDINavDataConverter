@@ -3,10 +3,11 @@ use std::io::{BufRead, Cursor};
 use std::path::Path;
 
 use anyhow::{Result, anyhow, bail};
+use rusqlite::Connection;
 use serde_json::{Map, Number, Value};
 
 use crate::db_json::{
-    extract_csv_fields_simple, json_string, json_to_i64, read_json_object_array, read_text_gbk,
+    configure_read_connection, extract_csv_fields_simple, read_text_gbk,
     trim_csv_field,
 };
 
@@ -62,34 +63,36 @@ struct DirectedAirwaySegment {
     end_id: i64,
 }
 
-pub(super) fn load_waypoint_candidates_from_json(
-    output_dir: &Path,
+pub(super) fn load_waypoint_candidates_from_db(
+    db_path: &Path,
 ) -> Result<HashMap<String, Vec<WaypointCandidate>>> {
-    let waypoints_path = output_dir.join("Waypoints.json");
-    if !waypoints_path.exists() {
-        bail!(
-            "Waypoints.json not found in output directory (required for airway generation): {}",
-            waypoints_path.display()
-        );
-    }
+    let conn = Connection::open(db_path)?;
+    configure_read_connection(&conn);
 
-    let rows = read_json_object_array(&waypoints_path)?;
+    let longitude_col = resolve_waypoint_longitude_column(&conn)?;
+    let sql = format!(
+        "SELECT ID, Ident, Latitude, {longitude_col} FROM Waypoints WHERE Ident IS NOT NULL AND Latitude IS NOT NULL AND {longitude_col} IS NOT NULL"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, f64>(2)?,
+            row.get::<_, f64>(3)?,
+        ))
+    })?;
+
     let mut candidates: HashMap<String, Vec<WaypointCandidate>> = HashMap::new();
     for row in rows {
-        let Some(id) = json_to_i64(row.get("ID")) else {
+        let (id, ident, latitude, longitude) = row?;
+        let ident = ident.trim();
+        if ident.is_empty() {
             continue;
-        };
-        let Some(ident) = json_string(row.get("Ident")) else {
-            continue;
-        };
-        let latitude = row.get("Latitude").and_then(|v| v.as_f64());
-        let longitude = row.get("Longitude").and_then(|v| v.as_f64());
-        let (Some(latitude), Some(longitude)) = (latitude, longitude) else {
-            continue;
-        };
+        }
 
         candidates
-            .entry(ident)
+            .entry(ident.to_string())
             .or_default()
             .push(WaypointCandidate {
                 id,
@@ -98,6 +101,29 @@ pub(super) fn load_waypoint_candidates_from_json(
             });
     }
     Ok(candidates)
+}
+
+fn resolve_waypoint_longitude_column(conn: &Connection) -> Result<&'static str> {
+    let mut statement = conn.prepare("PRAGMA table_info(Waypoints)")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let mut has_longitude = false;
+    let mut has_longtitude = false;
+    for row in rows {
+        let column = row?;
+        if column == "Longitude" {
+            has_longitude = true;
+        }
+        if column == "Longtitude" {
+            has_longtitude = true;
+        }
+    }
+    if has_longitude {
+        Ok("Longitude")
+    } else if has_longtitude {
+        Ok("Longtitude")
+    } else {
+        bail!("Waypoints table has neither Longitude nor Longtitude column")
+    }
 }
 
 pub(super) fn build_airway_tables_from_rte_seg(

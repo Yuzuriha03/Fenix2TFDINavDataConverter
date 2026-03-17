@@ -42,7 +42,7 @@ const DEBUG_RTE_SEG_PATH: &str = r"D:\yyz\Documents\NAIP\RTE_SEG.csv";
 #[derive(Clone, Debug)]
 pub(crate) struct AppConfig {
     pub(crate) debug: bool,
-    pub(crate) output_dir: PathBuf,
+    pub(crate) output_targets: Vec<OutputLocation>,
     pub(crate) output_label: String,
     pub(crate) reference_dir: Option<PathBuf>,
     pub(crate) db_path: Option<PathBuf>,
@@ -51,9 +51,9 @@ pub(crate) struct AppConfig {
 }
 
 #[derive(Clone, Debug)]
-struct OutputLocation {
-    label: String,
-    path: PathBuf,
+pub(crate) struct OutputLocation {
+    pub(crate) label: String,
+    pub(crate) path: PathBuf,
 }
 
 pub(crate) fn parse_args() -> Result<AppConfig> {
@@ -70,44 +70,61 @@ pub(crate) fn parse_args() -> Result<AppConfig> {
 
     if debug {
         let timestamp = debug_timestamp()?;
-        let detected_output = detect_output_directory().ok();
+        let debug_output_dir = Path::new("Nav-Primary_debug").join(timestamp);
+        let candidates = detect_output_directories();
+        let selected = select_output_locations(&candidates)?;
+        let output_label = if selected.len() == 1 {
+            format!("{} reference", selected[0].label)
+        } else {
+            format!("{} references", selected.len())
+        };
+        let reference_dir = selected.first().map(|location| location.path.clone());
+
         return Ok(AppConfig {
             debug: true,
-            output_dir: Path::new("Nav-Primary_debug").join(timestamp),
-            output_label: detected_output
-                .as_ref()
-                .map(|location| format!("{} reference", location.label))
-                .unwrap_or_else(|| "no installed Nav-Primary detected".to_string()),
-            reference_dir: detected_output.map(|location| location.path),
+            output_targets: vec![OutputLocation {
+                label: "DEBUG output".to_string(),
+                path: debug_output_dir,
+            }],
+            output_label,
+            reference_dir,
             db_path: Some(PathBuf::from(DEBUG_DB_PATH)),
             start_terminal_id: Some(DEBUG_START_TERMINAL_ID),
             rte_seg_path: Some(PathBuf::from(DEBUG_RTE_SEG_PATH)),
         });
     }
 
-    let detected_output = detect_output_directory()?;
+    let candidates = detect_output_directories();
+    let selected = select_output_locations(&candidates)?;
+    let output_label = if selected.len() == 1 {
+        selected[0].label.clone()
+    } else {
+        format!("{} locations", selected.len())
+    };
+    let reference_dir = selected.first().map(|location| location.path.clone());
+
     Ok(AppConfig {
         debug: false,
-        output_dir: detected_output.path.clone(),
-        output_label: detected_output.label,
-        reference_dir: Some(detected_output.path),
+        output_targets: selected,
+        output_label,
+        reference_dir,
         db_path: None,
         start_terminal_id: None,
         rte_seg_path: None,
     })
 }
 
-pub(crate) fn prepare_output_directory(config: &AppConfig) -> Result<()> {
-    fs::create_dir_all(&config.output_dir).with_context(|| {
+pub(crate) fn prepare_output_directory(output_dir: &Path) -> Result<()> {
+    fs::create_dir_all(output_dir).with_context(|| {
         format!(
             "failed to create output directory: {}",
-            config.output_dir.display()
+            output_dir.display()
         )
     })?;
-    fs::create_dir_all(config.output_dir.join("ProcedureLegs")).with_context(|| {
+    fs::create_dir_all(output_dir.join("ProcedureLegs")).with_context(|| {
         format!(
             "failed to create ProcedureLegs directory: {}",
-            config.output_dir.display()
+            output_dir.display()
         )
     })?;
     Ok(())
@@ -221,11 +238,18 @@ fn debug_timestamp() -> Result<String> {
     Ok(timestamp.to_string())
 }
 
+fn detect_output_directories() -> Vec<OutputLocation> {
+    nav_primary_candidates()
+        .into_iter()
+        .filter(|location| location.path.exists())
+        .collect()
+}
+
+#[allow(dead_code)]
 fn detect_output_directory() -> Result<OutputLocation> {
-    for location in nav_primary_candidates() {
-        if location.path.exists() {
-            return Ok(location);
-        }
+    let mut candidates = detect_output_directories();
+    if let Some(location) = candidates.pop() {
+        return Ok(location);
     }
 
     let candidates = nav_primary_candidates()
@@ -234,6 +258,58 @@ fn detect_output_directory() -> Result<OutputLocation> {
         .collect::<Vec<_>>()
         .join("\n");
     bail!("failed to detect TFDI MD-11 Nav-Primary directory.\n{candidates}");
+}
+
+fn select_output_locations(candidates: &[OutputLocation]) -> Result<Vec<OutputLocation>> {
+    if candidates.is_empty() {
+        bail!("failed to detect any valid Nav-Primary directories");
+    }
+    if candidates.len() == 1 {
+        return Ok(vec![candidates[0].clone()]);
+    }
+
+    println!("Multiple Nav-Primary directories were found. Choose which to update:");
+    for (idx, location) in candidates.iter().enumerate() {
+        println!(
+            "  {}) {} ({})",
+            idx + 1,
+            location.label,
+            location.path.display()
+        );
+    }
+    println!("Enter numbers (e.g. 1 or 1,3) or 'all':");
+
+    loop {
+        let input = prompt("> ")?;
+        let input = input.trim();
+        if input.eq_ignore_ascii_case("all") {
+            return Ok(candidates.to_vec());
+        }
+
+        let mut selection = Vec::new();
+        let mut invalid = false;
+        for part in input.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            match part.parse::<usize>() {
+                Ok(idx) if idx > 0 && idx <= candidates.len() => {
+                    selection.push(candidates[idx - 1].clone());
+                }
+                _ => {
+                    invalid = true;
+                    break;
+                }
+            }
+        }
+
+        if !invalid && !selection.is_empty() {
+            return Ok(selection);
+        }
+
+        println!("Invalid selection; enter numbers separated by commas or 'all'.");
+    }
 }
 
 fn nav_primary_candidates() -> Vec<OutputLocation> {

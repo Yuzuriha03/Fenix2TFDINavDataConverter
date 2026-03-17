@@ -27,10 +27,6 @@ impl AirwayMirrorReference {
         self.mirrored_edge_keys
             .contains(&undirected_airway_route_key(ident, waypoint1, waypoint2))
     }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.mirrored_edge_keys.is_empty()
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -41,13 +37,14 @@ pub(crate) struct AirwayReferenceData {
 }
 
 pub(crate) fn export_airway_tables(
+    db_path: &Path,
     output_dir: &Path,
     airway_reference: &AirwayReferenceData,
     rte_seg_path: &Path,
 ) -> Result<Vec<TableExportStats>> {
     let airway_db_read_time = Default::default();
 
-    let waypoint_candidates = rte_seg::load_waypoint_candidates_from_json(output_dir)?;
+    let waypoint_candidates = rte_seg::load_waypoint_candidates_from_db(db_path)?;
 
     let airway_transform_start = Instant::now();
     let (formatted_airways, formatted_legs) =

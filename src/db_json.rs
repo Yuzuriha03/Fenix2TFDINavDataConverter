@@ -9,11 +9,18 @@ use rusqlite::Connection;
 use rusqlite::types::Value as SqlValue;
 use serde_json::{Map, Number, Value};
 
+pub(crate) fn configure_read_connection(conn: &Connection) {
+    // Best-effort read tuning; ignore unsupported pragmas on some SQLite builds.
+    let _ = conn.pragma_update(None, "cache_size", -200_000i64);
+    let _ = conn.pragma_update(None, "temp_store", "MEMORY");
+    let _ = conn.pragma_update(None, "mmap_size", 256_i64 * 1024 * 1024);
+}
+
 pub(crate) fn fetch_table_rows(
     conn: &Connection,
     table_name: &str,
 ) -> Result<Vec<Map<String, Value>>> {
-    let sql = format!("SELECT * FROM {table_name}");
+    let sql = table_select_sql(conn, table_name)?;
     let mut statement = conn
         .prepare(&sql)
         .with_context(|| format!("failed to query table {table_name}"))?;
@@ -27,6 +34,64 @@ pub(crate) fn fetch_table_rows(
         .with_context(|| format!("failed to iterate table {table_name}"))?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .with_context(|| format!("failed to read table {table_name}"))
+}
+
+fn table_select_sql(conn: &Connection, table_name: &str) -> Result<String> {
+    match table_name {
+        "AirportLookup" => Ok("SELECT extID, ID FROM AirportLookup".to_string()),
+        "NavaidLookup" => {
+            Ok("SELECT Ident, Type, Country, NavKeyCode, ID FROM NavaidLookup".to_string())
+        }
+        "WaypointLookup" => Ok("SELECT Ident, Country, ID FROM WaypointLookup".to_string()),
+        "Terminals" => {
+            Ok("SELECT ID, AirportID, Proc, ICAO, FullName, Name, Rwy, RwyID FROM Terminals".to_string())
+        }
+        "AirwayLegs" => {
+            Ok("SELECT ID, AirwayID, Level, Waypoint1ID, Waypoint2ID, IsStart, IsEnd FROM AirwayLegs".to_string())
+        }
+        "Waypoints" => {
+            let longitude_col = resolve_longitude_column(conn, "Waypoints")?;
+            Ok(format!(
+                "SELECT ID, Ident, Name, Latitude, NavaidID, {longitude_col} AS Longitude, Collocated FROM Waypoints"
+            ))
+        }
+        "Runways" => {
+            let longitude_col = resolve_longitude_column(conn, "Runways")?;
+            Ok(format!(
+                "SELECT ID, AirportID, Ident, TrueHeading, Length, Width, Surface, Latitude, {longitude_col} AS Longitude, Elevation FROM Runways"
+            ))
+        }
+        _ => Ok(format!("SELECT * FROM {table_name}")),
+    }
+}
+
+fn resolve_longitude_column(conn: &Connection, table_name: &str) -> Result<&'static str> {
+    let mut statement = conn
+        .prepare(&format!("PRAGMA table_info({table_name})"))
+        .with_context(|| format!("failed to inspect schema for table {table_name}"))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .with_context(|| format!("failed to iterate schema for table {table_name}"))?;
+
+    let mut has_longitude = false;
+    let mut has_longtitude = false;
+    for row in rows {
+        let name = row.with_context(|| format!("failed to read schema row for table {table_name}"))?;
+        if name == "Longitude" {
+            has_longitude = true;
+        }
+        if name == "Longtitude" {
+            has_longtitude = true;
+        }
+    }
+
+    if has_longitude {
+        Ok("Longitude")
+    } else if has_longtitude {
+        Ok("Longtitude")
+    } else {
+        bail!("{table_name} table has neither Longitude nor Longtitude column")
+    }
 }
 
 pub(crate) fn sql_value_to_json(value: SqlValue) -> Value {
@@ -59,7 +124,7 @@ pub(crate) fn format_row(
     }
 
     match table_name {
-        "AirportLookup" => select_columns(row, &["ID", "extID"]),
+        "AirportLookup" => row,
         "Ilses" => select_columns(
             row,
             &[
@@ -77,24 +142,12 @@ pub(crate) fn format_row(
                 "HasDme",
             ],
         ),
-        "Terminals" => select_columns(
-            {
-                if let Some(proc_code) = json_to_i64(row.get("Proc")) {
-                    row.insert("Proc".to_string(), Value::Number(Number::from(proc_code)));
-                }
-                row
-            },
-            &[
-                "ID",
-                "AirportID",
-                "Proc",
-                "ICAO",
-                "FullName",
-                "Name",
-                "Rwy",
-                "RwyID",
-            ],
-        ),
+        "Terminals" => {
+            if let Some(proc_code) = json_to_i64(row.get("Proc")) {
+                row.insert("Proc".to_string(), Value::Number(Number::from(proc_code)));
+            }
+            row
+        }
         "Airports" => {
             if let Some(value) = row.remove("TransitionAltitude") {
                 row.insert("TransAlt".to_string(), value);
@@ -140,53 +193,15 @@ pub(crate) fn format_row(
                 row.insert("Waypoint2".to_string(), Value::Null);
             }
 
-            select_columns(
-                row,
-                &[
-                    "ID",
-                    "AirwayID",
-                    "Level",
-                    "Waypoint1ID",
-                    "Waypoint2ID",
-                    "IsStart",
-                    "IsEnd",
-                    "Waypoint1",
-                    "Waypoint2",
-                ],
-            )
+            row
         }
         "Navaids" => {
             row.remove("MagneticVariation");
             row.remove("Range");
             row
         }
-        "Waypoints" => select_columns(
-            row,
-            &[
-                "ID",
-                "Ident",
-                "Name",
-                "Latitude",
-                "NavaidID",
-                "Longitude",
-                "Collocated",
-            ],
-        ),
-        "Runways" => select_columns(
-            row,
-            &[
-                "ID",
-                "AirportID",
-                "Ident",
-                "TrueHeading",
-                "Length",
-                "Width",
-                "Surface",
-                "Latitude",
-                "Longitude",
-                "Elevation",
-            ],
-        ),
+        "Waypoints" => row,
+        "Runways" => row,
         _ => row,
     }
 }
@@ -215,11 +230,6 @@ pub(crate) fn json_to_i64(value: Option<&Value>) -> Option<i64> {
     }
 }
 
-pub(crate) fn json_string(value: Option<&Value>) -> Option<String> {
-    let text = json_text(value);
-    if text.is_empty() { None } else { Some(text) }
-}
-
 pub(crate) fn json_text(value: Option<&Value>) -> String {
     match value {
         Some(Value::String(text)) => text.trim().to_string(),
@@ -239,8 +249,12 @@ pub(crate) fn write_json(path: &Path, data: &[Value]) -> Result<()> {
 }
 
 pub(crate) fn write_json_objects(path: &Path, rows: &[Map<String, Value>]) -> Result<()> {
-    let values: Vec<Value> = rows.iter().cloned().map(Value::Object).collect();
-    write_json(path, &values)
+    let file =
+        File::create(path).with_context(|| format!("failed to create file: {}", path.display()))?;
+    let writer = BufWriter::with_capacity(1024 * 1024, file);
+    serde_json::to_writer(writer, rows)
+        .with_context(|| format!("failed to write json objects: {}", path.display()))?;
+    Ok(())
 }
 
 pub(crate) fn read_text_gbk(path: &Path) -> Result<String> {
@@ -309,7 +323,7 @@ fn row_to_map(
     row: &rusqlite::Row<'_>,
     column_names: &[String],
 ) -> rusqlite::Result<Map<String, Value>> {
-    let mut map = Map::new();
+    let mut map = Map::with_capacity(column_names.len());
     for (index, column_name) in column_names.iter().enumerate() {
         map.insert(column_name.clone(), sql_value_to_json(row.get(index)?));
     }
@@ -317,7 +331,7 @@ fn row_to_map(
 }
 
 fn select_columns(mut row: Map<String, Value>, ordered_columns: &[&str]) -> Map<String, Value> {
-    let mut ordered = Map::new();
+    let mut ordered = Map::with_capacity(ordered_columns.len());
     for column in ordered_columns {
         if let Some(value) = row.remove(*column) {
             ordered.insert((*column).to_string(), value);
