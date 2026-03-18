@@ -59,8 +59,7 @@ pub(crate) fn export_table_to_json(
         rows.into_par_iter()
             .filter_map(|row| {
                 let keep_row = json_to_i64(row.get("ID"))
-                    .map(|id| !existing.ids.contains(&id))
-                    .unwrap_or(true);
+                    .is_none_or(|id| !existing.ids.contains(&id));
                 keep_row.then(|| format_row(row, table_name, waypoints))
             })
             .collect()
@@ -199,6 +198,7 @@ fn scan_json_id_index(bytes: &[u8]) -> (HashSet<i64>, usize) {
     (ids, row_count)
 }
 
+#[allow(clippy::too_many_lines)]
 fn write_json_append_from_base(
     base_json_path: &Path,
     output_path: &Path,

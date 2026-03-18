@@ -140,19 +140,19 @@ fn resolve_waypoint_longitude_column(conn: &Connection) -> Result<&'static str> 
     let mut statement = conn.prepare("PRAGMA table_info(Waypoints)")?;
     let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
     let mut has_longitude = false;
-    let mut has_longtitude = false;
+    let mut has_legacy_longtitude = false;
     for row in rows {
         let column = row?;
         if column == "Longitude" {
             has_longitude = true;
         }
         if column == "Longtitude" {
-            has_longtitude = true;
+            has_legacy_longtitude = true;
         }
     }
     if has_longitude {
         Ok("Longitude")
-    } else if has_longtitude {
+    } else if has_legacy_longtitude {
         Ok("Longtitude")
     } else {
         bail!("Waypoints table has neither Longitude nor Longtitude column")
@@ -215,11 +215,11 @@ pub(super) fn build_airway_tables_from_rows(
                 );
                 leg_row.insert(
                     "IsStart".to_string(),
-                    Value::Number(Number::from(if index == 0 { 1 } else { 0 })),
+                    Value::Number(Number::from(i32::from(index == 0))),
                 );
                 leg_row.insert(
                     "IsEnd".to_string(),
-                    Value::Number(Number::from(if index + 1 == chain.len() { 1 } else { 0 })),
+                    Value::Number(Number::from(i32::from(index + 1 == chain.len()))),
                 );
                 leg_row.insert(
                     "Waypoint1".to_string(),
@@ -308,10 +308,9 @@ fn split_rte_seg_segments_into_chains(
     for segment in segments {
         let starts_new_chain = current_chain
             .last()
-            .map(|last: &DirectedAirwaySegment| {
+            .is_none_or(|last: &DirectedAirwaySegment| {
                 last.end_id != segment.start_id || last.end_ident != segment.start_ident
-            })
-            .unwrap_or(true);
+            });
         if starts_new_chain && !current_chain.is_empty() {
             chains.push(std::mem::take(&mut current_chain));
         }
@@ -357,7 +356,7 @@ fn coordinate_distance_sq(
 ) -> f64 {
     let latitude_delta = left_latitude - right_latitude;
     let longitude_delta = left_longitude - right_longitude;
-    latitude_delta * latitude_delta + longitude_delta * longitude_delta
+    latitude_delta.mul_add(latitude_delta, longitude_delta * longitude_delta)
 }
 
 fn load_rte_seg_mirror_reference_from_bufread<R: BufRead>(
@@ -425,7 +424,7 @@ fn parse_rte_seg_header_indices_simple(line: &str) -> Result<[usize; 4]> {
         index_map
             .get(name)
             .copied()
-            .ok_or_else(|| anyhow!("required RTE_SEG.csv column missing: {}", name))
+            .ok_or_else(|| anyhow!("required RTE_SEG.csv column missing: {name}"))
     };
     Ok([
         required("TXT_DESIG")?,
@@ -517,7 +516,7 @@ fn parse_rte_seg_airway_header_indices_simple(line: &str) -> Result<[usize; 8]> 
         index_map
             .get(name)
             .copied()
-            .ok_or_else(|| anyhow!("required RTE_SEG.csv column missing: {}", name))
+            .ok_or_else(|| anyhow!("required RTE_SEG.csv column missing: {name}"))
     };
     Ok([
         required("TXT_DESIG")?,

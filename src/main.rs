@@ -1,9 +1,9 @@
-mod airways;
-mod config;
-mod db_json;
-mod stats;
-mod tables;
-mod terminal_legs;
+pub mod airways;
+pub mod config;
+pub mod db_json;
+pub mod stats;
+pub mod tables;
+pub mod terminal_legs;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -106,6 +106,7 @@ fn main() {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run() -> Result<()> {
     let config = parse_args()?;
     let prewarm_handle = start_output_prewarm(&config);
@@ -479,12 +480,11 @@ fn resolve_input_paths(
     };
     let rte_seg_prewarm_handle = start_rte_seg_prewarm(rte_seg_path.clone());
 
-    let (db_path, db_validated_during_prompt) = match &config.db_path {
-        Some(path) => (path.clone(), false),
-        None => {
-            let path = prompt_db3_path()?;
-            (path, true)
-        }
+    let (db_path, db_validated_during_prompt) = if let Some(path) = &config.db_path {
+        (path.clone(), false)
+    } else {
+        let path = prompt_db3_path()?;
+        (path, true)
     };
 
     Ok((

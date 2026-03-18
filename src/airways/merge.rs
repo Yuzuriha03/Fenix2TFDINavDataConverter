@@ -75,8 +75,7 @@ impl Chain {
 fn row_text<'a>(row: &'a Map<String, Value>, key: &str) -> &'a str {
     row.get(key)
         .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("")
+    .map_or("", str::trim)
 }
 
 fn directed_edge(level: &str, from: &str, to: &str) -> DirectedEdge {
@@ -194,10 +193,9 @@ fn merge_ident(
     reference_legs_by_ident: &ReferenceLegRowsByIdent<'_>,
     mirror_reference: &super::AirwayMirrorReference,
 ) -> Option<IdentMergeResult> {
-    let source_legs_for_ident = source_legs_by_ident
+    let source_legs_for_ident: &[&Map<String, Value>] = source_legs_by_ident
         .get(ident)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
+        .map_or(&[][..], Vec::as_slice);
     if source_legs_for_ident.is_empty() {
         return None;
     }
@@ -205,10 +203,9 @@ fn merge_ident(
     let source_chains = extract_chains(source_legs_for_ident);
     let source_directionality =
         build_expected_directionality(ident, source_legs_for_ident, mirror_reference);
-    let existing_legs = reference_legs_by_ident
+    let existing_legs: &[&AirwayLegReferenceRow] = reference_legs_by_ident
         .get(ident)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
+        .map_or(&[][..], Vec::as_slice);
 
     let airway_row = build_output_airway_row(
         ident,
@@ -273,7 +270,7 @@ fn build_temp_airway_id_by_ident(idents: &[String]) -> HashMap<String, i64> {
     idents
         .iter()
         .enumerate()
-        .map(|(index, ident)| (ident.clone(), index as i64 + 1))
+    .map(|(index, ident)| (ident.clone(), one_based_i64(index)))
         .collect()
 }
 
@@ -387,73 +384,13 @@ fn extract_chains(rows: &[&Map<String, Value>]) -> Vec<Chain> {
 
     if is_sorted_by_id {
         for row in rows {
-            let from = row_text(row, "Waypoint1");
-            let to = row_text(row, "Waypoint2");
-            if from.is_empty() || to.is_empty() {
-                continue;
-            }
-
-            let is_start = json_to_i64(row.get("IsStart")) == Some(1);
-            if is_start || current_points.is_empty() {
-                if current_points.len() >= 2 {
-                    chains.push(Chain::from_points(std::mem::take(&mut current_points)));
-                }
-                current_points.push(from.to_string());
-                current_points.push(to.to_string());
-            } else {
-                if current_points.last().map(|p| p.as_str()) != Some(from) {
-                    if current_points.len() >= 2 {
-                        chains.push(Chain::from_points(std::mem::take(&mut current_points)));
-                    }
-                    current_points.push(from.to_string());
-                }
-                current_points.push(to.to_string());
-            }
-
-            let is_end = json_to_i64(row.get("IsEnd")) == Some(1);
-            if is_end {
-                if current_points.len() >= 2 {
-                    chains.push(Chain::from_points(std::mem::take(&mut current_points)));
-                } else {
-                    current_points.clear();
-                }
-            }
+            process_chain_row(row, &mut chains, &mut current_points);
         }
     } else {
         let mut sorted_rows_storage = rows.to_vec();
         sorted_rows_storage.sort_by_key(|row| json_to_i64(row.get("ID")).unwrap_or(i64::MAX));
         for row in &sorted_rows_storage {
-            let from = row_text(row, "Waypoint1");
-            let to = row_text(row, "Waypoint2");
-            if from.is_empty() || to.is_empty() {
-                continue;
-            }
-
-            let is_start = json_to_i64(row.get("IsStart")) == Some(1);
-            if is_start || current_points.is_empty() {
-                if current_points.len() >= 2 {
-                    chains.push(Chain::from_points(std::mem::take(&mut current_points)));
-                }
-                current_points.push(from.to_string());
-                current_points.push(to.to_string());
-            } else {
-                if current_points.last().map(|p| p.as_str()) != Some(from) {
-                    if current_points.len() >= 2 {
-                        chains.push(Chain::from_points(std::mem::take(&mut current_points)));
-                    }
-                    current_points.push(from.to_string());
-                }
-                current_points.push(to.to_string());
-            }
-
-            let is_end = json_to_i64(row.get("IsEnd")) == Some(1);
-            if is_end {
-                if current_points.len() >= 2 {
-                    chains.push(Chain::from_points(std::mem::take(&mut current_points)));
-                } else {
-                    current_points.clear();
-                }
-            }
+            process_chain_row(row, &mut chains, &mut current_points);
         }
     }
 
@@ -639,8 +576,7 @@ fn find_insert_path(from: &str, to: &str, source_chains: &[Chain]) -> Option<Vec
         let distance = path.len() - 1;
         if best
             .as_ref()
-            .map(|(best_dist, _)| distance < *best_dist)
-            .unwrap_or(true)
+            .is_none_or(|(best_dist, _)| distance < *best_dist)
         {
             best = Some((distance, path));
         }
@@ -732,7 +668,7 @@ fn build_rows_from_points(
         let template = template_lookup
             .get(&key)
             .cloned()
-            .unwrap_or(SegmentTemplate {
+            .unwrap_or_else(|| SegmentTemplate {
                 level: "B".to_string(),
                 from_id: None,
                 to_id: None,
@@ -779,15 +715,11 @@ fn build_rows_from_points(
 
         row.insert(
             "IsStart".to_string(),
-            Value::Number(Number::from(if idx == 0 && mark_start { 1 } else { 0 })),
+            Value::Number(Number::from(i32::from(idx == 0 && mark_start))),
         );
         row.insert(
             "IsEnd".to_string(),
-            Value::Number(Number::from(if idx + 1 == points.len() - 1 && mark_end {
-                1
-            } else {
-                0
-            })),
+            Value::Number(Number::from(i32::from(idx + 1 == points.len() - 1 && mark_end))),
         );
         row.insert("Waypoint1".to_string(), Value::String(from.clone()));
         row.insert("Waypoint2".to_string(), Value::String(to.clone()));
@@ -935,7 +867,7 @@ fn renumber_airways_and_legs(airways: &mut [Map<String, Value>], legs: &mut [Map
 
     let mut airway_id_map = HashMap::new();
     for (idx, row) in airways.iter_mut().enumerate() {
-        let new_id = idx as i64 + 1;
+        let new_id = one_based_i64(idx);
         if let Some(old_id) = json_to_i64(row.get("ID")) {
             airway_id_map.insert(old_id, new_id);
         }
@@ -966,7 +898,49 @@ fn renumber_airways_and_legs(airways: &mut [Map<String, Value>], legs: &mut [Map
     for (idx, row) in legs.iter_mut().enumerate() {
         row.insert(
             "ID".to_string(),
-            Value::Number(Number::from(idx as i64 + 1)),
+            Value::Number(Number::from(one_based_i64(idx))),
         );
     }
+}
+
+fn process_chain_row(
+    row: &Map<String, Value>,
+    chains: &mut Vec<Chain>,
+    current_points: &mut Vec<String>,
+) {
+    let from = row_text(row, "Waypoint1");
+    let to = row_text(row, "Waypoint2");
+    if from.is_empty() || to.is_empty() {
+        return;
+    }
+
+    let is_start = json_to_i64(row.get("IsStart")) == Some(1);
+    if is_start
+        || current_points.is_empty()
+        || current_points.last().map(String::as_str) != Some(from)
+    {
+        flush_chain(chains, current_points);
+        current_points.push(from.to_string());
+    }
+    current_points.push(to.to_string());
+
+    let is_end = json_to_i64(row.get("IsEnd")) == Some(1);
+    if is_end {
+        flush_chain(chains, current_points);
+    }
+}
+
+fn flush_chain(chains: &mut Vec<Chain>, current_points: &mut Vec<String>) {
+    if current_points.len() >= 2 {
+        chains.push(Chain::from_points(std::mem::take(current_points)));
+    } else {
+        current_points.clear();
+    }
+}
+
+fn one_based_i64(index: usize) -> i64 {
+    i64::try_from(index)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .unwrap_or(i64::MAX)
 }

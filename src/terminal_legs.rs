@@ -148,7 +148,7 @@ impl TerminalLegRecord {
         }
     }
 
-    fn vnav(&self) -> Option<f64> {
+    const fn vnav(&self) -> Option<f64> {
         self.vnav_num
     }
 }
@@ -310,8 +310,8 @@ pub(crate) fn export_terminal_legs(
     let db_read_time = db_read_start.elapsed();
     let row_count = terminal_legs.len();
 
-    let json_transform_time = Default::default();
-    detail.group_rows = Default::default();
+    let json_transform_time = std::time::Duration::default();
+    detail.group_rows = std::time::Duration::default();
 
     let json_write_start = Instant::now();
     let file_count = AtomicUsize::new(0);
@@ -485,9 +485,8 @@ fn procedure_dir_has_existing_files_from(output_dir: &Path, min_terminal_id: i64
                 procedure_dir.display()
             )
         })?;
-        let file_name = match entry.file_name().into_string() {
-            Ok(name) => name,
-            Err(_) => continue,
+        let Ok(file_name) = entry.file_name().into_string() else {
+            continue;
         };
         let Some(number_text) = file_name
             .strip_prefix("TermID_")
@@ -529,9 +528,8 @@ fn cleanup_extra_procedure_files(
                 procedure_dir.display()
             )
         })?;
-        let file_name = match entry.file_name().into_string() {
-            Ok(name) => name,
-            Err(_) => continue,
+        let Ok(file_name) = entry.file_name().into_string() else {
+            continue;
         };
         let Some(number_text) = file_name
             .strip_prefix("TermID_")
@@ -642,20 +640,20 @@ fn resolve_longitude_column(conn: &Connection, table_name: &str) -> Result<&'sta
         .with_context(|| format!("failed to iterate schema for {table_name}"))?;
 
     let mut has_longitude = false;
-    let mut has_longtitude = false;
+    let mut has_legacy_longtitude = false;
     for row in rows {
         let name = row.with_context(|| format!("failed to read schema row for {table_name}"))?;
         if name == "Longitude" {
             has_longitude = true;
         }
         if name == "Longtitude" {
-            has_longtitude = true;
+            has_legacy_longtitude = true;
         }
     }
 
     if has_longitude {
         Ok("Longitude")
-    } else if has_longtitude {
+    } else if has_legacy_longtitude {
         Ok("Longtitude")
     } else {
         anyhow::bail!("{table_name} table has neither Longitude nor Longtitude column")
@@ -672,9 +670,7 @@ fn should_fill_value(id_value: &Value, lat_value: &Value, lon_value: &Value) -> 
 
 fn rounded_number_value(value: f64) -> Value {
     let rounded = (value * 100_000_000.0).round() / 100_000_000.0;
-    Number::from_f64(rounded)
-        .map(Value::Number)
-        .unwrap_or(Value::Null)
+    Number::from_f64(rounded).map_or(Value::Null, Value::Number)
 }
 
 fn mark_final_approach_fix(legs: &mut [TerminalLegRecord]) {
@@ -682,16 +678,15 @@ fn mark_final_approach_fix(legs: &mut [TerminalLegRecord]) {
         return;
     }
 
-    let mut prefix_valid = match legs[0].vnav() {
-        Some(value) => value < 2.5,
-        None => legs[0].vnav.is_null(),
-    };
+    let mut prefix_valid =
+        legs[0]
+            .vnav()
+            .map_or_else(|| legs[0].vnav.is_null(), |value| value < 2.5);
 
     for index in 1..(legs.len() - 1) {
-        let current_valid = match legs[index].vnav() {
-            Some(value) => value < 2.5,
-            None => legs[index].vnav.is_null(),
-        };
+        let current_valid = legs[index]
+            .vnav()
+            .map_or_else(|| legs[index].vnav.is_null(), |value| value < 2.5);
         prefix_valid = prefix_valid && current_valid;
         if !prefix_valid {
             continue;

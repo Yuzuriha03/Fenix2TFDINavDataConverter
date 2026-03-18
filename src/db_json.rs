@@ -10,6 +10,7 @@ use rusqlite::params;
 use rusqlite::types::Value as SqlValue;
 use serde::Serialize;
 use serde_json::{Map, Number, Value};
+use std::string::ToString;
 
 const DEFAULT_JSON_WRITE_BUFFER_CAPACITY: usize = 1024 * 1024;
 
@@ -31,7 +32,7 @@ pub(crate) fn fetch_table_rows(
     let column_names: Vec<String> = statement
         .column_names()
         .into_iter()
-        .map(|name| name.to_string())
+        .map(ToString::to_string)
         .collect();
     let rows = statement
         .query_map([], |row| row_to_map(row, &column_names))
@@ -53,7 +54,7 @@ pub(crate) fn fetch_table_rows_after_id(
     let column_names: Vec<String> = statement
         .column_names()
         .into_iter()
-        .map(|name| name.to_string())
+        .map(ToString::to_string)
         .collect();
     let rows = statement
         .query_map(params![min_exclusive_id], |row| {
@@ -104,7 +105,7 @@ fn resolve_longitude_column(conn: &Connection, table_name: &str) -> Result<&'sta
         .with_context(|| format!("failed to iterate schema for table {table_name}"))?;
 
     let mut has_longitude = false;
-    let mut has_longtitude = false;
+    let mut has_legacy_longtitude = false;
     for row in rows {
         let name =
             row.with_context(|| format!("failed to read schema row for table {table_name}"))?;
@@ -112,13 +113,13 @@ fn resolve_longitude_column(conn: &Connection, table_name: &str) -> Result<&'sta
             has_longitude = true;
         }
         if name == "Longtitude" {
-            has_longtitude = true;
+            has_legacy_longtitude = true;
         }
     }
 
     if has_longitude {
         Ok("Longitude")
-    } else if has_longtitude {
+    } else if has_legacy_longtitude {
         Ok("Longtitude")
     } else {
         bail!("{table_name} table has neither Longitude nor Longtitude column")
@@ -129,9 +130,7 @@ pub(crate) fn sql_value_to_json(value: SqlValue) -> Value {
     match value {
         SqlValue::Null => Value::Null,
         SqlValue::Integer(number) => Value::Number(Number::from(number)),
-        SqlValue::Real(number) => Number::from_f64(number)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
+        SqlValue::Real(number) => Number::from_f64(number).map_or(Value::Null, Value::Number),
         SqlValue::Text(text) => Value::String(text),
         SqlValue::Blob(bytes) => Value::Array(
             bytes
@@ -155,7 +154,6 @@ pub(crate) fn format_row(
     }
 
     match table_name {
-        "AirportLookup" => row,
         "Ilses" => select_columns(
             row,
             &[
@@ -204,8 +202,7 @@ pub(crate) fn format_row(
                     waypoints
                         .and_then(|lookup| lookup.get(&waypoint_id))
                         .cloned()
-                        .map(Value::String)
-                        .unwrap_or(Value::Null),
+                        .map_or(Value::Null, Value::String),
                 );
             } else {
                 row.insert("Waypoint1".to_string(), Value::Null);
@@ -217,8 +214,7 @@ pub(crate) fn format_row(
                     waypoints
                         .and_then(|lookup| lookup.get(&waypoint_id))
                         .cloned()
-                        .map(Value::String)
-                        .unwrap_or(Value::Null),
+                        .map_or(Value::Null, Value::String),
                 );
             } else {
                 row.insert("Waypoint2".to_string(), Value::Null);
@@ -231,8 +227,6 @@ pub(crate) fn format_row(
             row.remove("Range");
             row
         }
-        "Waypoints" => row,
-        "Runways" => row,
         _ => row,
     }
 }
@@ -240,23 +234,14 @@ pub(crate) fn format_row(
 pub(crate) fn json_to_i64(value: Option<&Value>) -> Option<i64> {
     match value? {
         Value::Number(number) => number.as_i64().or_else(|| {
-            number.as_f64().and_then(|float| {
-                if float.fract() == 0.0 {
-                    Some(float as i64)
-                } else {
-                    None
-                }
-            })
+            number
+                .as_f64()
+                .and_then(integral_f64_to_i64)
         }),
-        Value::String(text) => text.parse::<i64>().ok().or_else(|| {
-            text.parse::<f64>().ok().and_then(|float| {
-                if float.fract() == 0.0 {
-                    Some(float as i64)
-                } else {
-                    None
-                }
-            })
-        }),
+        Value::String(text) => text
+            .parse::<i64>()
+            .ok()
+            .or_else(|| text.parse::<f64>().ok().and_then(integral_f64_to_i64)),
         _ => None,
     }
 }
@@ -324,10 +309,9 @@ pub(crate) fn extract_csv_fields_simple<'a, const N: usize>(
     let mut start = 0usize;
 
     loop {
-        let end = match trimmed[start..].find(',') {
-            Some(offset) => start + offset,
-            None => trimmed.len(),
-        };
+        let end = trimmed[start..]
+            .find(',')
+            .map_or(trimmed.len(), |offset| start + offset);
         for (slot, target_index) in indices.iter().enumerate() {
             if *target_index == field_index {
                 out[slot] = Some(trim_csv_field(&trimmed[start..end]));
@@ -365,12 +349,18 @@ fn select_columns(mut row: Map<String, Value>, ordered_columns: &[&str]) -> Map<
 }
 
 fn round_json_number(value: &Value) -> Value {
-    if let Some(number) = value.as_f64() {
+    value.as_f64().map_or_else(
+        || value.clone(),
+        |number| {
         let rounded = (number * 100_000_000.0).round() / 100_000_000.0;
-        Number::from_f64(rounded)
-            .map(Value::Number)
-            .unwrap_or(Value::Null)
-    } else {
-        value.clone()
+            Number::from_f64(rounded).map_or(Value::Null, Value::Number)
+        },
+    )
+}
+
+fn integral_f64_to_i64(float: f64) -> Option<i64> {
+    if !float.is_finite() || float.fract() != 0.0 {
+        return None;
     }
+    format!("{float:.0}").parse::<i64>().ok()
 }

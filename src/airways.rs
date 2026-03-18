@@ -1,5 +1,5 @@
 mod merge;
-mod rte_seg;
+pub mod rte_seg;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -14,6 +14,8 @@ use serde_json::{Map, Number, Value};
 
 use crate::db_json::write_json_objects;
 use crate::stats::{AirwayTimingBreakdown, PhaseDurations, TableExportStats};
+
+const CHUNK_SIZE: usize = 2048;
 
 pub(crate) use rte_seg::PreloadedRteSegData;
 pub(crate) use rte_seg::WaypointCandidate;
@@ -141,7 +143,6 @@ fn load_airway_legs_reference(path: &Path) -> Result<Vec<AirwayLegReferenceRow>>
     let object_ranges = split_top_level_json_object_ranges(&bytes)
         .with_context(|| format!("failed to split airway leg json array: {}", path.display()))?;
 
-    const CHUNK_SIZE: usize = 2048;
     let chunked_rows: Result<Vec<Vec<AirwayLegReferenceRow>>, serde_json::Error> = object_ranges
         .par_chunks(CHUNK_SIZE)
         .map(|chunk| {
@@ -259,7 +260,7 @@ pub(crate) fn export_airway_tables(
     preloaded_rte_seg: Option<&PreloadedRteSegData>,
     preloaded_waypoint_candidates: Option<&PreloadedWaypointCandidates>,
 ) -> Result<(Vec<TableExportStats>, AirwayTimingBreakdown)> {
-    let airway_db_read_time = Default::default();
+    let airway_db_read_time = Duration::default();
 
     let waypoint_candidate_start = Instant::now();
     let owned_rte_seg_rows;
@@ -319,7 +320,7 @@ pub(crate) fn export_airway_tables(
                 table_name: "AirwayLegs".to_string(),
                 row_count: final_legs.len(),
                 phase: PhaseDurations {
-                    db_read: Default::default(),
+                    db_read: Duration::default(),
                     json_transform: airway_leg_transform_time,
                     json_write: airway_leg_write_time,
                 },
@@ -398,7 +399,8 @@ pub(crate) fn load_airway_reference(
     ))
 }
 
-pub(super) fn directed_airway_route_key(ident: &str, waypoint1: &str, waypoint2: &str) -> String {
+#[must_use]
+pub fn directed_airway_route_key(ident: &str, waypoint1: &str, waypoint2: &str) -> String {
     format!("{ident}\u{1f}|{waypoint1}\u{1f}|{waypoint2}")
 }
 
