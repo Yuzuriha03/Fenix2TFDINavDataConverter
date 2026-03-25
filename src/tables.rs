@@ -58,8 +58,8 @@ pub(crate) fn export_table_to_json(
     let formatted_rows: Vec<Map<String, Value>> = if let Some(existing) = &existing_merge {
         rows.into_par_iter()
             .filter_map(|row| {
-                let keep_row = json_to_i64(row.get("ID"))
-                    .is_none_or(|id| !existing.ids.contains(&id));
+                let keep_row =
+                    json_to_i64(row.get("ID")).is_none_or(|id| !existing.ids.contains(&id));
                 keep_row.then(|| format_row(row, table_name, waypoints))
             })
             .collect()

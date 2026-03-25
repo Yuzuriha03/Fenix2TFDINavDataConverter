@@ -678,10 +678,9 @@ fn mark_final_approach_fix(legs: &mut [TerminalLegRecord]) {
         return;
     }
 
-    let mut prefix_valid =
-        legs[0]
-            .vnav()
-            .map_or_else(|| legs[0].vnav.is_null(), |value| value < 2.5);
+    let mut prefix_valid = legs[0]
+        .vnav()
+        .map_or_else(|| legs[0].vnav.is_null(), |value| value < 2.5);
 
     for index in 1..(legs.len() - 1) {
         let current_valid = legs[index]

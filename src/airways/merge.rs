@@ -73,9 +73,7 @@ impl Chain {
 }
 
 fn row_text<'a>(row: &'a Map<String, Value>, key: &str) -> &'a str {
-    row.get(key)
-        .and_then(Value::as_str)
-    .map_or("", str::trim)
+    row.get(key).and_then(Value::as_str).map_or("", str::trim)
 }
 
 fn directed_edge(level: &str, from: &str, to: &str) -> DirectedEdge {
@@ -270,7 +268,7 @@ fn build_temp_airway_id_by_ident(idents: &[String]) -> HashMap<String, i64> {
     idents
         .iter()
         .enumerate()
-    .map(|(index, ident)| (ident.clone(), one_based_i64(index)))
+        .map(|(index, ident)| (ident.clone(), one_based_i64(index)))
         .collect()
 }
 
@@ -539,7 +537,10 @@ fn apply_mirror_rows(
             let level = row_text(row, "Level");
             let from = row_text(row, "Waypoint1");
             let to = row_text(row, "Waypoint2");
-            if from.is_empty() || to.is_empty() || !mirror_reference.should_mirror(ident, level, from, to) {
+            if from.is_empty()
+                || to.is_empty()
+                || !mirror_reference.should_mirror(ident, level, from, to)
+            {
                 None
             } else {
                 let reverse = directed_edge(level, to, from);
@@ -719,7 +720,9 @@ fn build_rows_from_points(
         );
         row.insert(
             "IsEnd".to_string(),
-            Value::Number(Number::from(i32::from(idx + 1 == points.len() - 1 && mark_end))),
+            Value::Number(Number::from(i32::from(
+                idx + 1 == points.len() - 1 && mark_end,
+            ))),
         );
         row.insert("Waypoint1".to_string(), Value::String(from.clone()));
         row.insert("Waypoint2".to_string(), Value::String(to.clone()));

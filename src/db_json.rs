@@ -233,11 +233,9 @@ pub(crate) fn format_row(
 
 pub(crate) fn json_to_i64(value: Option<&Value>) -> Option<i64> {
     match value? {
-        Value::Number(number) => number.as_i64().or_else(|| {
-            number
-                .as_f64()
-                .and_then(integral_f64_to_i64)
-        }),
+        Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_f64().and_then(integral_f64_to_i64)),
         Value::String(text) => text
             .parse::<i64>()
             .ok()
@@ -352,7 +350,7 @@ fn round_json_number(value: &Value) -> Value {
     value.as_f64().map_or_else(
         || value.clone(),
         |number| {
-        let rounded = (number * 100_000_000.0).round() / 100_000_000.0;
+            let rounded = (number * 100_000_000.0).round() / 100_000_000.0;
             Number::from_f64(rounded).map_or(Value::Null, Value::Number)
         },
     )

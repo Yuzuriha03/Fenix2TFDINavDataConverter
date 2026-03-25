@@ -380,9 +380,7 @@ fn prewarm_output_targets(
 
         Ok((
             output.path.clone(),
-            OutputPrewarmResult {
-                start_terminal_id,
-            },
+            OutputPrewarmResult { start_terminal_id },
         ))
     };
 
@@ -581,9 +579,7 @@ fn execute_output_target(params: ExecuteOutputTargetParams<'_>) -> Result<Output
                 preloaded_waypoint_candidates,
                 preloaded_existing_indices,
             })?;
-            return Ok(OutputExecutionResult {
-                output,
-            });
+            return Ok(OutputExecutionResult { output });
         }
     };
 
@@ -599,9 +595,7 @@ fn execute_output_target(params: ExecuteOutputTargetParams<'_>) -> Result<Output
         preloaded_existing_indices,
     })?;
 
-    Ok(OutputExecutionResult {
-        output,
-    })
+    Ok(OutputExecutionResult { output })
 }
 
 fn export_db3_to_json(params: ExportDb3ToJsonParams<'_>) -> Result<ExportStats> {
