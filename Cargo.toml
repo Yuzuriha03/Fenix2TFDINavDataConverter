@@ -2,6 +2,11 @@
 name = "fenix2tfdi_nav_data_converter"
 version = "0.1.0"
 edition = "2024"
+description = "Convert Fenix nav data into the TFDI MD-11 navigation data format."
+license = "GPL-3.0-only"
+repository = "https://github.com/Yuzuriha03/Fenix2TFDINavDataConverter"
+keywords = ["fenix", "tfdi", "navdata", "aviation", "converter"]
+categories = ["command-line-utilities"]
 
 [build-dependencies]
 winresource = "0.1.31"
