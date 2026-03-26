@@ -35,6 +35,13 @@ pub(crate) struct PreformattedJsonExport<'a> {
     pub(crate) format_time: std::time::Duration,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct JsonArrayBounds {
+    first_non_ws: usize,
+    last_non_ws: usize,
+    has_existing_items: bool,
+}
+
 pub(crate) fn export_table_to_json(
     db_path: &Path,
     output_dir: &Path,
@@ -235,7 +242,6 @@ fn scan_json_id_index(bytes: &[u8]) -> (HashSet<i64>, usize) {
     (ids, row_count)
 }
 
-#[allow(clippy::too_many_lines)]
 fn write_json_append_from_base(
     base_json_path: &Path,
     output_path: &Path,
@@ -249,68 +255,74 @@ fn write_json_append_from_base(
         return Ok(());
     }
 
-    let base_bytes = fs::read(base_json_path).with_context(|| {
-        format!(
-            "failed to read reference json: {}",
-            base_json_path.display()
-        )
-    })?;
-    let Some(last_non_ws) = base_bytes
-        .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-    else {
-        anyhow::bail!("reference json is empty: {}", base_json_path.display());
+    let base_bytes = read_json_bytes(base_json_path)?;
+    let bounds = json_array_bounds(&base_bytes, base_json_path)?;
+    let appended_inner = encode_appended_rows_inner(output_path, appended_rows)?;
+    write_appended_json(output_path, &base_bytes, bounds, &appended_inner)?;
+
+    Ok(())
+}
+
+fn read_json_bytes(path: &Path) -> Result<Vec<u8>> {
+    fs::read(path).with_context(|| format!("failed to read reference json: {}", path.display()))
+}
+
+fn json_array_bounds(bytes: &[u8], path: &Path) -> Result<JsonArrayBounds> {
+    let Some(last_non_ws) = bytes.iter().rposition(|byte| !byte.is_ascii_whitespace()) else {
+        anyhow::bail!("reference json is empty: {}", path.display());
     };
-    if base_bytes[last_non_ws] != b']' {
+    if bytes[last_non_ws] != b']' {
         anyhow::bail!(
             "reference json is not an array ending with ']': {}",
-            base_json_path.display()
+            path.display()
         );
     }
 
-    let Some(first_non_ws) = base_bytes
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-    else {
-        anyhow::bail!("reference json is empty: {}", base_json_path.display());
+    let Some(first_non_ws) = bytes.iter().position(|byte| !byte.is_ascii_whitespace()) else {
+        anyhow::bail!("reference json is empty: {}", path.display());
     };
-    if base_bytes[first_non_ws] != b'[' {
+    if bytes[first_non_ws] != b'[' {
         anyhow::bail!(
             "reference json is not an array starting with '[': {}",
-            base_json_path.display()
+            path.display()
         );
     }
 
-    let has_existing_items = base_bytes[first_non_ws + 1..last_non_ws]
-        .iter()
-        .any(|byte| !byte.is_ascii_whitespace());
+    Ok(JsonArrayBounds {
+        first_non_ws,
+        last_non_ws,
+        has_existing_items: bytes[first_non_ws + 1..last_non_ws]
+            .iter()
+            .any(|byte| !byte.is_ascii_whitespace()),
+    })
+}
 
+fn encode_appended_rows_inner(
+    output_path: &Path,
+    appended_rows: &[Map<String, Value>],
+) -> Result<Vec<u8>> {
     let appended_bytes = serde_json::to_vec(appended_rows).with_context(|| {
         format!(
             "failed to encode appended rows for {}",
             output_path.display()
         )
     })?;
-    let appended_last_non_ws = appended_bytes
-        .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-        .unwrap_or(0);
-    let appended_first_non_ws = appended_bytes
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .unwrap_or(0);
-    if appended_bytes.get(appended_first_non_ws) != Some(&b'[')
-        || appended_bytes.get(appended_last_non_ws) != Some(&b']')
-    {
-        anyhow::bail!("appended rows are not a JSON array");
-    }
-    let appended_inner = &appended_bytes[appended_first_non_ws + 1..appended_last_non_ws];
+    let bounds = json_array_bounds(&appended_bytes, output_path)
+        .context("appended rows are not a JSON array")?;
+    Ok(appended_bytes[bounds.first_non_ws + 1..bounds.last_non_ws].to_vec())
+}
 
+fn write_appended_json(
+    output_path: &Path,
+    base_bytes: &[u8],
+    bounds: JsonArrayBounds,
+    appended_inner: &[u8],
+) -> Result<()> {
     let output_file = File::create(output_path)
         .with_context(|| format!("failed to create output json: {}", output_path.display()))?;
     let mut writer = BufWriter::with_capacity(1024 * 1024, output_file);
     writer
-        .write_all(&base_bytes[..last_non_ws])
+        .write_all(&base_bytes[..bounds.last_non_ws])
         .with_context(|| {
             format!(
                 "failed to write merged json prefix: {}",
@@ -318,7 +330,7 @@ fn write_json_append_from_base(
             )
         })?;
     if !appended_inner.is_empty() {
-        if has_existing_items {
+        if bounds.has_existing_items {
             writer.write_all(b",").with_context(|| {
                 format!(
                     "failed to write merged json delimiter: {}",
@@ -337,7 +349,7 @@ fn write_json_append_from_base(
         .write_all(b"]")
         .with_context(|| format!("failed to finalize merged json: {}", output_path.display()))?;
     writer
-        .write_all(&base_bytes[last_non_ws + 1..])
+        .write_all(&base_bytes[bounds.last_non_ws + 1..])
         .with_context(|| {
             format!(
                 "failed to write merged json suffix: {}",
@@ -346,9 +358,7 @@ fn write_json_append_from_base(
         })?;
     writer
         .flush()
-        .with_context(|| format!("failed to flush merged json: {}", output_path.display()))?;
-
-    Ok(())
+        .with_context(|| format!("failed to flush merged json: {}", output_path.display()))
 }
 
 fn copy_json_bytes(source_path: &Path, output_path: &Path) -> Result<()> {

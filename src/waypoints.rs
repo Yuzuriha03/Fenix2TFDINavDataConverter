@@ -9,13 +9,14 @@ use rusqlite::Connection;
 use serde_json::{Map, Number, Value};
 
 use crate::db_json::{
-    configure_read_connection, fetch_table_rows, fetch_table_rows_after_id, format_row, json_to_i64,
+    configure_read_connection, fetch_table_rows, format_row, json_to_i64, write_json_objects,
 };
 use crate::stats::TableExportStats;
 use crate::tables::{
     ExistingJsonIndex, PreformattedJsonExport, export_preformatted_rows_to_json,
     load_existing_id_index,
 };
+use crate::terminal_filters::is_excluded_terminal_row;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ReferenceIdIndex {
@@ -292,13 +293,25 @@ pub(crate) fn export_terminals_table(
     base_json_dir: Option<&Path>,
     airport_id_index: &AirportIdIndex,
     runway_id_index: &RunwayIdIndex,
-    preloaded_existing_index: Option<ExistingJsonIndex>,
+    _preloaded_existing_index: Option<&ExistingJsonIndex>,
 ) -> Result<TableExportStats> {
-    export_reference_table_with_preserved_ids(
-        db_path,
-        output_dir,
-        base_json_dir,
-        "Terminals",
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("failed to open database: {}", db_path.display()))?;
+    configure_read_connection(&conn);
+
+    let existing_load_start = Instant::now();
+    let existing_rows = load_existing_json_rows(base_json_dir, "Terminals.json")?;
+    let existing_load_time = existing_load_start.elapsed();
+
+    let db_read_start = Instant::now();
+    let rows = fetch_table_rows(&conn, "Terminals")?;
+    let db_read_time = db_read_start.elapsed();
+    let source_rows = rows.len();
+
+    let format_start = Instant::now();
+    let formatted_rows = build_filtered_terminal_rows(
+        rows,
+        existing_rows,
         &[
             ForeignKeyRemap {
                 column_name: "AirportID",
@@ -309,8 +322,60 @@ pub(crate) fn export_terminals_table(
                 index: runway_id_index,
             },
         ],
-        preloaded_existing_index,
-    )
+    );
+    let format_time = format_start.elapsed();
+
+    let output_path = output_dir.join("Terminals.json");
+    let json_write_start = Instant::now();
+    write_json_objects(&output_path, &formatted_rows)?;
+
+    Ok(TableExportStats {
+        table_name: "Terminals".to_string(),
+        row_count: formatted_rows.len(),
+        phase: crate::stats::PhaseDurations {
+            db_read: db_read_time,
+            json_transform: existing_load_time + format_time,
+            json_write: json_write_start.elapsed(),
+        },
+        detail: Some(crate::stats::TableTimingBreakdown {
+            source_rows,
+            formatted_rows: formatted_rows.len(),
+            existing_load: existing_load_time,
+            format_rows: format_time,
+            merge_rows: std::time::Duration::default(),
+        }),
+    })
+}
+
+fn build_filtered_terminal_rows(
+    db_rows: Vec<Map<String, Value>>,
+    existing_rows: Vec<Map<String, Value>>,
+    foreign_key_remaps: &[ForeignKeyRemap<'_>],
+) -> Vec<Map<String, Value>> {
+    let mut kept_existing_rows = existing_rows
+        .into_iter()
+        .filter(|row| !is_excluded_terminal_row(row))
+        .collect::<Vec<_>>();
+    let existing_ids = kept_existing_rows
+        .iter()
+        .filter_map(|row| json_to_i64(row.get("ID")))
+        .collect::<HashSet<_>>();
+
+    let mut appended_rows = db_rows
+        .into_iter()
+        .filter_map(|mut row| {
+            let keep_row = json_to_i64(row.get("ID")).is_none_or(|id| !existing_ids.contains(&id));
+            if !keep_row {
+                return None;
+            }
+
+            apply_foreign_key_remaps(&mut row, foreign_key_remaps);
+            Some(format_row(row, "Terminals", None))
+        })
+        .collect::<Vec<_>>();
+    appended_rows.sort_by_key(|row| json_to_i64(row.get("ID")).unwrap_or(i64::MAX));
+    kept_existing_rows.append(&mut appended_rows);
+    kept_existing_rows
 }
 
 fn build_reference_id_index(
@@ -374,67 +439,6 @@ fn export_reference_table(
             }
 
             row.insert("ID".to_string(), Value::Number(Number::from(output_id)));
-            apply_foreign_key_remaps(&mut row, foreign_key_remaps);
-            Some(format_row(row, table_name, None))
-        })
-        .collect::<Vec<_>>();
-    let format_time = format_start.elapsed();
-
-    export_preformatted_rows_to_json(PreformattedJsonExport {
-        output_dir,
-        table_name,
-        formatted_rows: &formatted_rows,
-        existing_merge: existing_merge.as_ref(),
-        source_rows,
-        existing_load_time,
-        db_read_time,
-        format_time,
-    })
-}
-
-fn export_reference_table_with_preserved_ids(
-    db_path: &Path,
-    output_dir: &Path,
-    base_json_dir: Option<&Path>,
-    table_name: &str,
-    foreign_key_remaps: &[ForeignKeyRemap<'_>],
-    preloaded_existing_index: Option<ExistingJsonIndex>,
-) -> Result<TableExportStats> {
-    let conn = Connection::open(db_path)
-        .with_context(|| format!("failed to open database: {}", db_path.display()))?;
-    configure_read_connection(&conn);
-
-    let existing_load_start = Instant::now();
-    let existing_merge = match preloaded_existing_index {
-        Some(existing) => Some(existing),
-        None => load_existing_id_index(base_json_dir, table_name)?,
-    };
-    let existing_load_time = existing_load_start.elapsed();
-
-    let db_read_start = Instant::now();
-    let rows = if let Some(existing) = &existing_merge {
-        if let Some(max_id) = existing.ids.iter().max().copied() {
-            fetch_table_rows_after_id(&conn, table_name, max_id)?
-        } else {
-            fetch_table_rows(&conn, table_name)?
-        }
-    } else {
-        fetch_table_rows(&conn, table_name)?
-    };
-    let db_read_time = db_read_start.elapsed();
-    let source_rows = rows.len();
-
-    let format_start = Instant::now();
-    let formatted_rows = rows
-        .into_iter()
-        .filter_map(|mut row| {
-            let keep_row = existing_merge.as_ref().is_none_or(|existing| {
-                json_to_i64(row.get("ID")).is_none_or(|id| !existing.ids.contains(&id))
-            });
-            if !keep_row {
-                return None;
-            }
-
             apply_foreign_key_remaps(&mut row, foreign_key_remaps);
             Some(format_row(row, table_name, None))
         })
@@ -676,5 +680,39 @@ mod tests {
 
         assert!(index.output_id_for_db(10) > 20);
         assert_eq!(index.output_id_for_db(20), 20);
+    }
+
+    fn terminal_row(id: i64, icao: &str, name: &str, full_name: &str) -> Map<String, Value> {
+        let mut row = Map::new();
+        row.insert("ID".to_string(), Value::Number(Number::from(id)));
+        row.insert("AirportID".to_string(), Value::Number(Number::from(1)));
+        row.insert("Proc".to_string(), Value::Number(Number::from(1)));
+        row.insert("ICAO".to_string(), Value::String(icao.to_string()));
+        row.insert("FullName".to_string(), Value::String(full_name.to_string()));
+        row.insert("Name".to_string(), Value::String(name.to_string()));
+        row.insert("Rwy".to_string(), Value::String("10".to_string()));
+        row.insert("RwyID".to_string(), Value::Number(Number::from(2)));
+        row
+    }
+
+    #[test]
+    fn filtered_terminal_rows_drop_existing_and_new_zuls_entries() {
+        let db_rows = vec![
+            terminal_row(10, "ZULS", "DEP1A", "DEP1A RWY10"),
+            terminal_row(11, "ZBAA", "OK1A", "OK1A"),
+            terminal_row(12, "ZULS", "DUM08A", "DUM08A"),
+        ];
+        let existing_rows = vec![
+            terminal_row(5, "ZULS", "R10-Z", "R10-Z"),
+            terminal_row(6, "ZSPD", "KEEP1A", "KEEP1A"),
+        ];
+
+        let merged = build_filtered_terminal_rows(db_rows, existing_rows, &[]);
+        let ids = merged
+            .iter()
+            .filter_map(|row| json_to_i64(row.get("ID")))
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![6, 10, 11, 12]);
     }
 }

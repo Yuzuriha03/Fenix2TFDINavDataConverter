@@ -8,13 +8,14 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use rusqlite::{Connection, params_from_iter};
 use serde::ser::{Serialize, SerializeStruct, Serializer};
-use serde_json::{Number, Value};
+use serde_json::{Map, Number, Value};
 
 use crate::db_json::{
     configure_read_connection, json_to_i64, sql_value_to_json,
     write_json_objects_if_changed_with_buffer, write_json_objects_with_buffer,
 };
 use crate::stats::{PhaseDurations, TerminalLegExportStats, TerminalLegTimingBreakdown};
+use crate::terminal_filters::is_excluded_terminal_row;
 use crate::waypoints::{NavaidIdIndex, ReferenceIdIndex, WaypointIdIndex};
 
 const PROCEDURE_LEG_JSON_BUFFER_CAPACITY: usize = 16 * 1024;
@@ -274,7 +275,9 @@ pub(crate) fn export_terminal_legs(
     waypoint_id_index: &WaypointIdIndex,
     navaid_id_index: &NavaidIdIndex,
 ) -> Result<TerminalLegExportStats> {
-    let cleanup_required = procedure_dir_has_existing_files_from(output_dir, start_terminal_id)?;
+    let excluded_existing_terminal_ids = load_excluded_existing_terminal_ids(output_dir)?;
+    let cleanup_required = procedure_dir_has_existing_files_from(output_dir, start_terminal_id)?
+        || !excluded_existing_terminal_ids.is_empty();
     let files_may_already_exist = cleanup_required;
     let db_read_start = Instant::now();
     let (
@@ -294,7 +297,9 @@ pub(crate) fn export_terminal_legs(
         let runway_ids_by_terminal =
             fetch_runway_ids_by_terminal_after_start(conn, start_terminal_id)?;
         let terminal_ids_for_cleanup = if cleanup_required {
-            Some(fetch_all_terminal_ids(conn)?)
+            let mut terminal_ids = fetch_all_terminal_ids(conn)?;
+            terminal_ids.retain(|id| !excluded_existing_terminal_ids.contains(id));
+            Some(terminal_ids)
         } else {
             None
         };
@@ -339,13 +344,50 @@ pub(crate) fn export_terminal_legs(
     detail.group_rows = std::time::Duration::default();
 
     let json_write_start = Instant::now();
-    let file_count = AtomicUsize::new(0);
-    TerminalJobIter::new(
+    let file_count = write_terminal_leg_files(
+        output_dir,
+        files_may_already_exist,
         terminal_legs,
         &runway_ids_by_terminal,
         &runway_coords,
         &waypoint_coords,
         &navaid_coords,
+    )?;
+
+    if let Some(terminal_ids) = terminal_ids_for_cleanup {
+        let cleanup_start = Instant::now();
+        let _ = cleanup_extra_procedure_files(output_dir, &terminal_ids)?;
+        detail.cleanup_files = cleanup_start.elapsed();
+    }
+
+    Ok(TerminalLegExportStats {
+        row_count,
+        file_count,
+        phase: PhaseDurations {
+            db_read: db_read_time,
+            json_transform: json_transform_time,
+            json_write: json_write_start.elapsed(),
+        },
+        detail,
+    })
+}
+
+fn write_terminal_leg_files(
+    output_dir: &Path,
+    files_may_already_exist: bool,
+    terminal_legs: Vec<TerminalLegRecord>,
+    runway_ids_by_terminal: &HashMap<i64, i64>,
+    runway_coords: &HashMap<i64, (f64, f64)>,
+    waypoint_coords: &HashMap<i64, (f64, f64)>,
+    navaid_coords: &HashMap<i64, (f64, f64)>,
+) -> Result<usize> {
+    let file_count = AtomicUsize::new(0);
+    TerminalJobIter::new(
+        terminal_legs,
+        runway_ids_by_terminal,
+        runway_coords,
+        waypoint_coords,
+        navaid_coords,
     )
     .par_bridge()
     .try_for_each(|(terminal_id, mut legs)| {
@@ -359,29 +401,14 @@ pub(crate) fn export_terminal_legs(
                 &output_path,
                 &legs,
                 PROCEDURE_LEG_JSON_BUFFER_CAPACITY,
-            )
-            .map(|_| ())
+            )?;
+            Ok(())
         } else {
             write_json_objects_with_buffer(&output_path, &legs, PROCEDURE_LEG_JSON_BUFFER_CAPACITY)
         }
     })?;
 
-    if let Some(terminal_ids) = terminal_ids_for_cleanup {
-        let cleanup_start = Instant::now();
-        let _ = cleanup_extra_procedure_files(output_dir, &terminal_ids)?;
-        detail.cleanup_files = cleanup_start.elapsed();
-    }
-
-    Ok(TerminalLegExportStats {
-        row_count,
-        file_count: file_count.load(Ordering::Relaxed),
-        phase: PhaseDurations {
-            db_read: db_read_time,
-            json_transform: json_transform_time,
-            json_write: json_write_start.elapsed(),
-        },
-        detail,
-    })
+    Ok(file_count.load(Ordering::Relaxed))
 }
 
 fn with_connection<T>(db_path: &Path, action: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
@@ -425,6 +452,28 @@ fn fetch_runway_ids_by_terminal_after_start(
         runway_ids_by_terminal.insert(terminal_id, runway_id);
     }
     Ok(runway_ids_by_terminal)
+}
+
+fn load_excluded_existing_terminal_ids(output_dir: &Path) -> Result<HashSet<i64>> {
+    let path = output_dir.join("Terminals.json");
+    if !path.exists() {
+        return Ok(HashSet::new());
+    }
+
+    let bytes = fs::read(&path)
+        .with_context(|| format!("failed to read existing terminals json: {}", path.display()))?;
+    let rows: Vec<Map<String, Value>> = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "failed to parse existing terminals json: {}",
+            path.display()
+        )
+    })?;
+
+    Ok(rows
+        .into_iter()
+        .filter(is_excluded_terminal_row)
+        .filter_map(|row| json_to_i64(row.get("ID")))
+        .collect())
 }
 
 fn fetch_all_terminal_ids(conn: &Connection) -> Result<HashSet<i64>> {
@@ -800,5 +849,44 @@ fn parse_vnav(value: Option<&Value>) -> Option<f64> {
             }
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn make_test_dir(prefix: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{prefix}_{unique}"));
+        fs::create_dir_all(dir.join("ProcedureLegs")).expect("create ProcedureLegs");
+        dir
+    }
+
+    #[test]
+    fn cleanup_extra_procedure_files_removes_ids_not_in_allowed_set() {
+        let output_dir = make_test_dir("fenix2tfdi_cleanup");
+        let procedure_dir = output_dir.join("ProcedureLegs");
+        let keep_path = procedure_dir.join("TermID_100.json");
+        let remove_path = procedure_dir.join("TermID_200.json");
+        let ignored_path = procedure_dir.join("not_a_terminal_file.json");
+
+        fs::write(&keep_path, "[]").expect("write keep file");
+        fs::write(&remove_path, "[]").expect("write stale file");
+        fs::write(&ignored_path, "[]").expect("write ignored file");
+
+        let allowed = HashSet::from([100_i64]);
+        let removed = cleanup_extra_procedure_files(&output_dir, &allowed).expect("cleanup files");
+
+        assert_eq!(removed, 1);
+        assert!(keep_path.exists());
+        assert!(!remove_path.exists());
+        assert!(ignored_path.exists());
+
+        fs::remove_dir_all(&output_dir).expect("remove temp dir");
     }
 }

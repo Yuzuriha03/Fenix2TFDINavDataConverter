@@ -3,6 +3,7 @@ pub mod config;
 pub mod db_json;
 pub mod stats;
 pub mod tables;
+pub mod terminal_filters;
 pub mod terminal_legs;
 pub mod waypoints;
 
@@ -17,8 +18,8 @@ use rayon::prelude::*;
 use rusqlite::Connection;
 
 use airways::{
-    AirwayReferenceData, AirwayReferenceLoadTiming, PreloadedAirwayReferenceJson,
-    PreloadedRteSegData, PreloadedWaypointCandidates, export_airway_tables, load_airway_reference,
+    AirwayReferenceData, PreloadedAirwayReferenceJson, PreloadedRteSegData,
+    PreloadedWaypointCandidates, export_airway_tables, load_airway_reference,
     preload_airway_reference_json, preload_waypoint_candidates,
 };
 use config::{
@@ -26,7 +27,9 @@ use config::{
     prompt_db3_path, prompt_rte_seg_path, validate_required_tables,
 };
 use db_json::configure_read_connection;
-use stats::{AirwayTimingBreakdown, ExportStats, TableExportStats, TerminalLegExportStats};
+use stats::{
+    AirwayTimingBreakdown, ExportStats, PhaseDurations, TableExportStats, TerminalLegExportStats,
+};
 use tables::{ExistingJsonIndex, export_table_to_json, preload_existing_table_indices};
 use terminal_legs::export_terminal_legs;
 use waypoints::{
@@ -64,6 +67,7 @@ struct OutputPrewarmResult {
 #[derive(Debug)]
 struct OutputExecutionResult {
     output: OutputLocation,
+    export_stats: ExportStats,
 }
 
 type PreloadedTableIndicesByName = HashMap<String, ExistingJsonIndex>;
@@ -71,8 +75,6 @@ type PreloadedTableIndicesByName = HashMap<String, ExistingJsonIndex>;
 struct SharedAirwayReferenceContext {
     runtime_reference_dir: Option<PathBuf>,
     airway_reference: AirwayReferenceData,
-    load_timing: AirwayReferenceLoadTiming,
-    load_time: Duration,
 }
 
 enum AirwayReferenceSource<'a> {
@@ -180,7 +182,6 @@ fn main() {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn run() -> Result<()> {
     let config = parse_args()?;
     let prewarm_handle = start_output_prewarm(&config);
@@ -192,163 +193,258 @@ fn run() -> Result<()> {
     let prewarmed_outputs = join_output_prewarm(prewarm_handle)?;
     let mut preloaded_table_indices = join_table_index_prewarm(table_index_prewarm_handle)?;
 
-    let (
-        output_results,
-        _load_airway_reference_time,
-        _airway_reference_load_timing,
-        _validate_db_time,
-        _export_total,
-    ) = if config.output_targets.len() > 1 {
-        let (preloaded_airway_result, validate_result) = rayon::join(
-            || {
-                let (preloaded_rte_seg_result, preloaded_reference_jsons_result) = rayon::join(
-                    || join_rte_seg_prewarm(rte_seg_prewarm_handle),
-                    || join_airway_reference_json_prewarm(airway_reference_json_prewarm_handle),
-                );
-                let preloaded_rte_seg = preloaded_rte_seg_result?;
-                let preloaded_waypoint_candidates =
-                    preload_waypoint_candidates(&resolved_paths.db_path, &preloaded_rte_seg)?;
-                Ok::<_, anyhow::Error>((
-                    preloaded_rte_seg,
-                    preloaded_reference_jsons_result?,
-                    preloaded_waypoint_candidates,
-                ))
-            },
-            || {
-                validate_db_if_needed(
-                    &resolved_paths.db_path,
-                    resolved_paths.db_validated_during_prompt,
-                )
-            },
-        );
-        let (preloaded_rte_seg, mut preloaded_reference_jsons, preloaded_waypoint_candidates) =
-            preloaded_airway_result?;
-        let validate_db_time = validate_result?;
-        let export_start = Instant::now();
-        let per_target_inputs = config
-            .output_targets
-            .iter()
-            .cloned()
-            .map(|output| {
-                let preloaded_reference_json = take_preloaded_airway_reference_json(
-                    &mut preloaded_reference_jsons,
-                    Some(output.path.as_path()),
-                );
-                let preloaded_existing_indices = take_preloaded_table_indices(
-                    &mut preloaded_table_indices,
-                    output.path.as_path(),
-                );
-                (output, preloaded_reference_json, preloaded_existing_indices)
-            })
-            .collect::<Vec<_>>();
-
-        let parallel_results = per_target_inputs
-            .into_par_iter()
-            .map(
-                |(output, preloaded_reference_json, preloaded_existing_indices)| {
-                    let prewarmed = prewarmed_outputs.get(&output.path);
-                    execute_output_target(ExecuteOutputTargetParams {
-                        output,
-                        prewarmed,
-                        db_path: &resolved_paths.db_path,
-                        rte_seg_path: &resolved_paths.rte_seg_path,
-                        preloaded_rte_seg: &preloaded_rte_seg,
-                        preloaded_waypoint_candidates: &preloaded_waypoint_candidates,
-                        preloaded_reference_json,
-                        preloaded_existing_indices,
-                        reference_source: AirwayReferenceSource::PerTarget,
-                    })
-                },
-            )
-            .collect::<Vec<_>>();
-
-        (
-            parallel_results
-                .into_iter()
-                .collect::<Result<Vec<OutputExecutionResult>>>()?,
-            Duration::default(),
-            AirwayReferenceLoadTiming::default(),
-            validate_db_time,
-            export_start.elapsed(),
-        )
-    } else {
-        let (shared_reference_result, validate_result) = rayon::join(
-            || {
-                let (preloaded_rte_seg_result, preloaded_reference_jsons_result) = rayon::join(
-                    || join_rte_seg_prewarm(rte_seg_prewarm_handle),
-                    || join_airway_reference_json_prewarm(airway_reference_json_prewarm_handle),
-                );
-                let preloaded_rte_seg = preloaded_rte_seg_result?;
-                let mut preloaded_reference_jsons = preloaded_reference_jsons_result?;
-                let (shared_reference_result, preloaded_waypoint_candidates_result) = rayon::join(
-                    || {
-                        prepare_and_load_shared_airway_reference(
-                            &config,
-                            &resolved_paths.rte_seg_path,
-                            &preloaded_rte_seg,
-                            take_preloaded_airway_reference_json(
-                                &mut preloaded_reference_jsons,
-                                config.reference_dir.as_deref(),
-                            ),
-                        )
-                    },
-                    || preload_waypoint_candidates(&resolved_paths.db_path, &preloaded_rte_seg),
-                );
-                Ok::<_, anyhow::Error>((
-                    shared_reference_result?,
-                    preloaded_rte_seg,
-                    preloaded_waypoint_candidates_result?,
-                ))
-            },
-            || {
-                validate_db_if_needed(
-                    &resolved_paths.db_path,
-                    resolved_paths.db_validated_during_prompt,
-                )
-            },
-        );
-        let (shared_reference, preloaded_rte_seg, preloaded_waypoint_candidates) =
-            shared_reference_result?;
-        let preloaded_existing_indices = take_preloaded_table_indices(
+    let output_results = if config.output_targets.len() > 1 {
+        execute_multi_output_run(
+            &config,
+            &resolved_paths,
+            &prewarmed_outputs,
             &mut preloaded_table_indices,
-            config.output_targets[0].path.as_path(),
-        );
-        let validate_db_time = validate_result?;
-        let export_start = Instant::now();
-
-        (
-            vec![execute_output_target(ExecuteOutputTargetParams {
-                output: config.output_targets[0].clone(),
-                prewarmed: prewarmed_outputs.get(&config.output_targets[0].path),
-                db_path: &resolved_paths.db_path,
-                rte_seg_path: &resolved_paths.rte_seg_path,
-                preloaded_rte_seg: &preloaded_rte_seg,
-                preloaded_waypoint_candidates: &preloaded_waypoint_candidates,
-                preloaded_reference_json: None,
-                preloaded_existing_indices,
-                reference_source: AirwayReferenceSource::Shared {
-                    base_json_dir: shared_reference.runtime_reference_dir.as_deref(),
-                    airway_reference: &shared_reference.airway_reference,
-                },
-            })?],
-            shared_reference.load_time,
-            shared_reference.load_timing,
-            validate_db_time,
-            export_start.elapsed(),
-        )
+            rte_seg_prewarm_handle,
+            airway_reference_json_prewarm_handle,
+        )?
+    } else {
+        execute_single_output_run(
+            &config,
+            &resolved_paths,
+            &prewarmed_outputs,
+            &mut preloaded_table_indices,
+            rte_seg_prewarm_handle,
+            airway_reference_json_prewarm_handle,
+        )?
     };
 
-    for result in &output_results {
+    print_output_reports(&output_results, total_start.elapsed());
+
+    Ok(())
+}
+
+fn execute_multi_output_run(
+    config: &config::AppConfig,
+    resolved_paths: &ResolvedInputPaths,
+    prewarmed_outputs: &HashMap<PathBuf, OutputPrewarmResult>,
+    preloaded_table_indices: &mut HashMap<PathBuf, PreloadedTableIndicesByName>,
+    rte_seg_prewarm_handle: thread::JoinHandle<Result<PreloadedRteSegData>>,
+    airway_reference_json_prewarm_handle: thread::JoinHandle<
+        Result<HashMap<PathBuf, PreloadedAirwayReferenceJson>>,
+    >,
+) -> Result<Vec<OutputExecutionResult>> {
+    let (preloaded_airway_result, _validate_db_time) = rayon::join(
+        || {
+            let (preloaded_rte_seg_result, preloaded_reference_jsons_result) = rayon::join(
+                || join_rte_seg_prewarm(rte_seg_prewarm_handle),
+                || join_airway_reference_json_prewarm(airway_reference_json_prewarm_handle),
+            );
+            let preloaded_rte_seg = preloaded_rte_seg_result?;
+            let preloaded_waypoint_candidates =
+                preload_waypoint_candidates(&resolved_paths.db_path, &preloaded_rte_seg)?;
+            Ok::<_, anyhow::Error>((
+                preloaded_rte_seg,
+                preloaded_reference_jsons_result?,
+                preloaded_waypoint_candidates,
+            ))
+        },
+        || {
+            validate_db_if_needed(
+                &resolved_paths.db_path,
+                resolved_paths.db_validated_during_prompt,
+            )
+        },
+    );
+    let (preloaded_rte_seg, mut preloaded_reference_jsons, preloaded_waypoint_candidates) =
+        preloaded_airway_result?;
+    let per_target_inputs = config
+        .output_targets
+        .iter()
+        .cloned()
+        .map(|output| {
+            let preloaded_reference_json = take_preloaded_airway_reference_json(
+                &mut preloaded_reference_jsons,
+                Some(output.path.as_path()),
+            );
+            let preloaded_existing_indices =
+                take_preloaded_table_indices(preloaded_table_indices, output.path.as_path());
+            (output, preloaded_reference_json, preloaded_existing_indices)
+        })
+        .collect::<Vec<_>>();
+
+    per_target_inputs
+        .into_par_iter()
+        .map(
+            |(output, preloaded_reference_json, preloaded_existing_indices)| {
+                let prewarmed = prewarmed_outputs.get(&output.path);
+                execute_output_target(ExecuteOutputTargetParams {
+                    output,
+                    prewarmed,
+                    db_path: &resolved_paths.db_path,
+                    rte_seg_path: &resolved_paths.rte_seg_path,
+                    preloaded_rte_seg: &preloaded_rte_seg,
+                    preloaded_waypoint_candidates: &preloaded_waypoint_candidates,
+                    preloaded_reference_json,
+                    preloaded_existing_indices,
+                    reference_source: AirwayReferenceSource::PerTarget,
+                })
+            },
+        )
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn execute_single_output_run(
+    config: &config::AppConfig,
+    resolved_paths: &ResolvedInputPaths,
+    prewarmed_outputs: &HashMap<PathBuf, OutputPrewarmResult>,
+    preloaded_table_indices: &mut HashMap<PathBuf, PreloadedTableIndicesByName>,
+    rte_seg_prewarm_handle: thread::JoinHandle<Result<PreloadedRteSegData>>,
+    airway_reference_json_prewarm_handle: thread::JoinHandle<
+        Result<HashMap<PathBuf, PreloadedAirwayReferenceJson>>,
+    >,
+) -> Result<Vec<OutputExecutionResult>> {
+    let (shared_reference_result, _validate_db_time) = rayon::join(
+        || {
+            let (preloaded_rte_seg_result, preloaded_reference_jsons_result) = rayon::join(
+                || join_rte_seg_prewarm(rte_seg_prewarm_handle),
+                || join_airway_reference_json_prewarm(airway_reference_json_prewarm_handle),
+            );
+            let preloaded_rte_seg = preloaded_rte_seg_result?;
+            let mut preloaded_reference_jsons = preloaded_reference_jsons_result?;
+            let (shared_reference_result, preloaded_waypoint_candidates_result) = rayon::join(
+                || {
+                    prepare_and_load_shared_airway_reference(
+                        config,
+                        &resolved_paths.rte_seg_path,
+                        &preloaded_rte_seg,
+                        take_preloaded_airway_reference_json(
+                            &mut preloaded_reference_jsons,
+                            config.reference_dir.as_deref(),
+                        ),
+                    )
+                },
+                || preload_waypoint_candidates(&resolved_paths.db_path, &preloaded_rte_seg),
+            );
+            Ok::<_, anyhow::Error>((
+                shared_reference_result?,
+                preloaded_rte_seg,
+                preloaded_waypoint_candidates_result?,
+            ))
+        },
+        || {
+            validate_db_if_needed(
+                &resolved_paths.db_path,
+                resolved_paths.db_validated_during_prompt,
+            )
+        },
+    );
+    let (shared_reference, preloaded_rte_seg, preloaded_waypoint_candidates) =
+        shared_reference_result?;
+    let preloaded_existing_indices = take_preloaded_table_indices(
+        preloaded_table_indices,
+        config.output_targets[0].path.as_path(),
+    );
+
+    Ok(vec![execute_output_target(ExecuteOutputTargetParams {
+        output: config.output_targets[0].clone(),
+        prewarmed: prewarmed_outputs.get(&config.output_targets[0].path),
+        db_path: &resolved_paths.db_path,
+        rte_seg_path: &resolved_paths.rte_seg_path,
+        preloaded_rte_seg: &preloaded_rte_seg,
+        preloaded_waypoint_candidates: &preloaded_waypoint_candidates,
+        preloaded_reference_json: None,
+        preloaded_existing_indices,
+        reference_source: AirwayReferenceSource::Shared {
+            base_json_dir: shared_reference.runtime_reference_dir.as_deref(),
+            airway_reference: &shared_reference.airway_reference,
+        },
+    })?])
+}
+
+fn print_output_reports(output_results: &[OutputExecutionResult], total_elapsed: Duration) {
+    for result in output_results {
         println!(
             "Updated {} ({})",
             result.output.label,
             result.output.path.display()
         );
+        print_export_stats(&result.export_stats);
     }
 
-    println!("Total elapsed: {}", format_duration(total_start.elapsed()));
+    println!("Total elapsed: {}", format_duration(total_elapsed));
+}
 
-    Ok(())
+fn print_export_stats(stats: &ExportStats) {
+    println!(
+        "  Waypoint index: {} rows in {}",
+        stats.waypoint_count,
+        format_duration(stats.waypoint_index_wall)
+    );
+
+    let mut summed_table_phase = PhaseDurations::default();
+    for table in &stats.table_stats {
+        summed_table_phase.add_assign(&table.phase);
+    }
+    println!(
+        "  Table batch: {} tables in {} (db {}, transform {}, write {}, summed {})",
+        stats.table_stats.len(),
+        format_duration(stats.table_export_wall),
+        format_duration(summed_table_phase.db_read),
+        format_duration(summed_table_phase.json_transform),
+        format_duration(summed_table_phase.json_write),
+        format_duration(summed_table_phase.total())
+    );
+    for table in &stats.table_stats {
+        print_table_export_stats(table);
+    }
+
+    let terminal_legs = &stats.terminal_leg_stats;
+    println!(
+        "  Terminal legs: {} rows, {} files in {} (phase total {}, db {}, transform {}, write {}, legs {}, metadata {}, runway {}, waypoint {}, group {}, cleanup {})",
+        terminal_legs.row_count,
+        terminal_legs.file_count,
+        format_duration(stats.terminal_leg_wall),
+        format_duration(terminal_legs.phase.total()),
+        format_duration(terminal_legs.phase.db_read),
+        format_duration(terminal_legs.phase.json_transform),
+        format_duration(terminal_legs.phase.json_write),
+        format_duration(terminal_legs.detail.db_terminal_legs),
+        format_duration(terminal_legs.detail.db_terminal_metadata),
+        format_duration(terminal_legs.detail.db_runway_coords),
+        format_duration(terminal_legs.detail.db_waypoint_coords),
+        format_duration(terminal_legs.detail.group_rows),
+        format_duration(terminal_legs.detail.cleanup_files)
+    );
+
+    println!(
+        "  Airways: waypoint candidates {}, build {}, merge {}, write airways {}, write legs {}",
+        format_duration(stats.airway_detail.waypoint_candidates_load),
+        format_duration(stats.airway_detail.build_from_rte_seg),
+        format_duration(stats.airway_detail.merge_outputs),
+        format_duration(stats.airway_detail.write_airways),
+        format_duration(stats.airway_detail.write_airway_legs)
+    );
+    println!("  Output total: {}", format_duration(stats.total_elapsed));
+}
+
+fn print_table_export_stats(table: &TableExportStats) {
+    println!(
+        "    {}: {} rows (phase total {}, db {}, transform {}, write {})",
+        table.table_name,
+        table.row_count,
+        format_duration(table.phase.total()),
+        format_duration(table.phase.db_read),
+        format_duration(table.phase.json_transform),
+        format_duration(table.phase.json_write)
+    );
+
+    if let Some(detail) = &table.detail {
+        println!(
+            "      source {}, formatted {}, existing {}, format {}, merge {}",
+            detail.source_rows,
+            detail.formatted_rows,
+            format_duration(detail.existing_load),
+            format_duration(detail.format_rows),
+            format_duration(detail.merge_rows)
+        );
+    }
 }
 
 fn start_output_prewarm(
@@ -591,20 +687,16 @@ fn prepare_and_load_shared_airway_reference(
 ) -> Result<SharedAirwayReferenceContext> {
     let runtime_reference_dir = config.reference_dir.clone();
 
-    let load_airway_reference_start = Instant::now();
-    let (airway_reference, load_timing) = load_airway_reference(
+    let (airway_reference, _) = load_airway_reference(
         runtime_reference_dir.as_deref(),
         rte_seg_path,
         Some(preloaded_rte_seg),
         preloaded_reference_json,
     )?;
-    let load_time = load_airway_reference_start.elapsed();
 
     Ok(SharedAirwayReferenceContext {
         runtime_reference_dir,
         airway_reference,
-        load_timing,
-        load_time,
     })
 }
 
@@ -642,7 +734,7 @@ fn execute_output_target(params: ExecuteOutputTargetParams<'_>) -> Result<Output
                 Some(preloaded_rte_seg),
                 preloaded_reference_json,
             )?;
-            let _ = export_db3_to_json(ExportDb3ToJsonParams {
+            let export_stats = export_db3_to_json(ExportDb3ToJsonParams {
                 db_path,
                 start_terminal_id,
                 output_dir: &output.path,
@@ -653,11 +745,14 @@ fn execute_output_target(params: ExecuteOutputTargetParams<'_>) -> Result<Output
                 preloaded_waypoint_candidates,
                 preloaded_existing_indices,
             })?;
-            return Ok(OutputExecutionResult { output });
+            return Ok(OutputExecutionResult {
+                output,
+                export_stats,
+            });
         }
     };
 
-    let _ = export_db3_to_json(ExportDb3ToJsonParams {
+    let export_stats = export_db3_to_json(ExportDb3ToJsonParams {
         db_path,
         start_terminal_id,
         output_dir: &output.path,
@@ -669,7 +764,10 @@ fn execute_output_target(params: ExecuteOutputTargetParams<'_>) -> Result<Output
         preloaded_existing_indices,
     })?;
 
-    Ok(OutputExecutionResult { output })
+    Ok(OutputExecutionResult {
+        output,
+        export_stats,
+    })
 }
 
 fn export_db3_to_json(params: ExportDb3ToJsonParams<'_>) -> Result<ExportStats> {
@@ -859,7 +957,7 @@ fn export_table_job(
             context.base_json_dir,
             &indices.airport,
             &indices.runway,
-            preloaded_existing_index,
+            preloaded_existing_index.as_ref(),
         ),
         _ => export_table_to_json(
             context.db_path,

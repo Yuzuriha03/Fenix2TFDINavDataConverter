@@ -191,21 +191,6 @@ fn detect_output_directories() -> Vec<OutputLocation> {
         .collect()
 }
 
-#[allow(dead_code)]
-fn detect_output_directory() -> Result<OutputLocation> {
-    let mut candidates = detect_output_directories();
-    if let Some(location) = candidates.pop() {
-        return Ok(location);
-    }
-
-    let candidates = nav_primary_candidates()
-        .into_iter()
-        .map(|location| format!("{}: {}", location.label, location.path.display()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    bail!("failed to detect TFDI MD-11 Nav-Primary directory.\n{candidates}");
-}
-
 fn select_output_locations(candidates: &[OutputLocation]) -> Result<Vec<OutputLocation>> {
     if candidates.is_empty() {
         bail!("failed to detect any valid Nav-Primary directories");

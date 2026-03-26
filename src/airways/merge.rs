@@ -34,6 +34,12 @@ struct SourceDirectionality {
     undirected: HashSet<UndirectedEdge>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SourceMergeState<'a> {
+    chains: &'a [Chain],
+    directionality: &'a SourceDirectionality,
+}
+
 #[derive(Clone, Debug)]
 struct SegmentTemplate {
     level: String,
@@ -211,6 +217,10 @@ fn merge_ident(
         source_airway_by_ident,
         reference_airway_by_ident,
     );
+    let source_merge_state = SourceMergeState {
+        chains: &source_chains,
+        directionality: &source_directionality,
+    };
 
     let mut next_leg_id = 1;
     let legs = if has_connection(&source_chains, existing_legs) {
@@ -219,8 +229,7 @@ fn merge_ident(
             airway_id,
             source_legs_for_ident,
             existing_legs,
-            &source_chains,
-            &source_directionality,
+            source_merge_state,
             mirror_reference,
             &mut next_leg_id,
         )
@@ -427,14 +436,12 @@ fn build_expected_directionality(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn merge_with_insertion_strategy(
     ident: &str,
     airway_id: i64,
     source_legs: &[&Map<String, Value>],
     existing_legs: &[&AirwayLegReferenceRow],
-    source_chains: &[Chain],
-    source_directionality: &SourceDirectionality,
+    source_merge_state: SourceMergeState<'_>,
     mirror_reference: &super::AirwayMirrorReference,
     next_leg_id: &mut i64,
 ) -> Vec<Map<String, Value>> {
@@ -454,7 +461,7 @@ fn merge_with_insertion_strategy(
             continue;
         }
 
-        let insert_path = find_insert_path(from, to, source_chains);
+        let insert_path = find_insert_path(from, to, source_merge_state.chains);
         if let Some(points) = insert_path
             && points.len() > 2
         {
@@ -498,7 +505,7 @@ fn merge_with_insertion_strategy(
     }
 
     let mirrored = apply_mirror_rows(ident, merged, &mut seen, mirror_reference, next_leg_id);
-    reconcile_and_dedup_directionality(mirrored, source_directionality)
+    reconcile_and_dedup_directionality(mirrored, source_merge_state.directionality)
 }
 
 fn build_independent_append(
