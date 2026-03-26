@@ -1,24 +1,51 @@
-use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use rusqlite::{Connection, params_from_iter};
+use rustc_hash::{FxHashMap, FxHashSet};
+use serde::Deserialize;
 use serde::ser::{Serialize, SerializeStruct, Serializer};
-use serde_json::{Map, Number, Value};
+use serde_json::{Number, Value};
 
-use crate::db_json::{
-    configure_read_connection, json_to_i64, sql_value_to_json,
-    write_json_objects_if_changed_with_buffer, write_json_objects_with_buffer,
-};
+use crate::db_json::{configure_read_connection, json_to_i64, sql_value_to_json};
 use crate::stats::{PhaseDurations, TerminalLegExportStats, TerminalLegTimingBreakdown};
-use crate::terminal_filters::is_excluded_terminal_row;
+use crate::terminal_filters::is_excluded_terminal;
 use crate::waypoints::{NavaidIdIndex, ReferenceIdIndex, WaypointIdIndex};
 
 const PROCEDURE_LEG_JSON_BUFFER_CAPACITY: usize = 16 * 1024;
+
+thread_local! {
+    static TERMINAL_LEG_JSON_SCRATCH: RefCell<Vec<u8>> =
+        RefCell::new(Vec::with_capacity(PROCEDURE_LEG_JSON_BUFFER_CAPACITY));
+}
+
+fn fast_hash_map<K, V>() -> FxHashMap<K, V> {
+    FxHashMap::default()
+}
+
+fn fast_hash_map_with_capacity<K, V>(capacity: usize) -> FxHashMap<K, V> {
+    FxHashMap::with_capacity_and_hasher(capacity, Default::default())
+}
+
+fn fast_hash_set<T>() -> FxHashSet<T> {
+    FxHashSet::default()
+}
+
+#[derive(Debug, Deserialize)]
+struct ExistingTerminalFilterRow {
+    #[serde(rename = "ID")]
+    id: Option<i64>,
+    #[serde(rename = "ICAO")]
+    icao: Option<String>,
+    #[serde(rename = "Name")]
+    name: Option<String>,
+    #[serde(rename = "FullName")]
+    full_name: Option<String>,
+}
 
 #[derive(Clone, Debug)]
 struct TerminalLegRecord {
@@ -104,10 +131,10 @@ impl TerminalLegRecord {
 
     fn fill_coordinates(
         &mut self,
-        runway_ids_by_terminal: &HashMap<i64, i64>,
-        runway_coords: &HashMap<i64, (f64, f64)>,
-        waypoint_coords: &HashMap<i64, (f64, f64)>,
-        navaid_coords: &HashMap<i64, (f64, f64)>,
+        runway_ids_by_terminal: &FxHashMap<i64, i64>,
+        runway_coords: &FxHashMap<i64, (f64, f64)>,
+        waypoint_coords: &FxHashMap<i64, (f64, f64)>,
+        navaid_coords: &FxHashMap<i64, (f64, f64)>,
     ) {
         let missing_wpt = value_is_null(&self.wpt_id)
             && value_is_null(&self.wpt_lat)
@@ -305,7 +332,7 @@ pub(crate) fn export_terminal_legs(
         };
         let db_terminal_metadata = t_terminal_metadata.elapsed();
 
-        let runway_ids: HashSet<i64> = runway_ids_by_terminal.values().copied().collect();
+        let runway_ids: FxHashSet<i64> = runway_ids_by_terminal.values().copied().collect();
         let waypoint_ids = collect_waypoint_reference_ids(&terminal_legs);
         let navaid_ids = collect_navaid_reference_ids(&terminal_legs);
 
@@ -376,39 +403,70 @@ fn write_terminal_leg_files(
     output_dir: &Path,
     files_may_already_exist: bool,
     terminal_legs: Vec<TerminalLegRecord>,
-    runway_ids_by_terminal: &HashMap<i64, i64>,
-    runway_coords: &HashMap<i64, (f64, f64)>,
-    waypoint_coords: &HashMap<i64, (f64, f64)>,
-    navaid_coords: &HashMap<i64, (f64, f64)>,
+    runway_ids_by_terminal: &FxHashMap<i64, i64>,
+    runway_coords: &FxHashMap<i64, (f64, f64)>,
+    waypoint_coords: &FxHashMap<i64, (f64, f64)>,
+    navaid_coords: &FxHashMap<i64, (f64, f64)>,
 ) -> Result<usize> {
-    let file_count = AtomicUsize::new(0);
-    TerminalJobIter::new(
-        terminal_legs,
-        runway_ids_by_terminal,
-        runway_coords,
-        waypoint_coords,
-        navaid_coords,
-    )
-    .par_bridge()
-    .try_for_each(|(terminal_id, mut legs)| {
-        file_count.fetch_add(1, Ordering::Relaxed);
-        mark_final_approach_fix(&mut legs);
-        let output_path = output_dir
-            .join("ProcedureLegs")
-            .join(format!("TermID_{terminal_id}.json"));
-        if files_may_already_exist {
-            write_json_objects_if_changed_with_buffer(
-                &output_path,
-                &legs,
-                PROCEDURE_LEG_JSON_BUFFER_CAPACITY,
-            )?;
-            Ok(())
-        } else {
-            write_json_objects_with_buffer(&output_path, &legs, PROCEDURE_LEG_JSON_BUFFER_CAPACITY)
-        }
-    })?;
+    let mut grouped_legs = group_terminal_legs_by_terminal(terminal_legs);
+    let file_count = grouped_legs.len();
+    let chunk_size = (grouped_legs.len() / (rayon::current_num_threads() * 4)).clamp(16, 128);
 
-    Ok(file_count.load(Ordering::Relaxed))
+    grouped_legs
+        .par_chunks_mut(chunk_size)
+        .try_for_each(|chunk| {
+            for (terminal_id, legs) in chunk {
+                for leg in legs.iter_mut() {
+                    leg.fill_coordinates(
+                        runway_ids_by_terminal,
+                        runway_coords,
+                        waypoint_coords,
+                        navaid_coords,
+                    );
+                }
+                mark_final_approach_fix(legs);
+                let output_path = output_dir
+                    .join("ProcedureLegs")
+                    .join(format!("TermID_{terminal_id}.json"));
+                write_terminal_leg_json_file(&output_path, legs, files_may_already_exist)?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })?;
+
+    Ok(file_count)
+}
+
+fn write_terminal_leg_json_file(
+    output_path: &Path,
+    legs: &[TerminalLegRecord],
+    files_may_already_exist: bool,
+) -> Result<()> {
+    TERMINAL_LEG_JSON_SCRATCH.with(|scratch| {
+        let mut encoded = scratch.borrow_mut();
+        encoded.clear();
+        serde_json::to_writer(&mut *encoded, legs).with_context(|| {
+            format!(
+                "failed to encode terminal leg json: {}",
+                output_path.display()
+            )
+        })?;
+
+        if files_may_already_exist
+            && let Ok(metadata) = fs::metadata(output_path)
+            && metadata.len() == encoded.len() as u64
+            && let Ok(existing) = fs::read(output_path)
+            && existing == *encoded
+        {
+            return Ok(());
+        }
+
+        fs::write(output_path, &*encoded).with_context(|| {
+            format!(
+                "failed to write terminal leg json: {}",
+                output_path.display()
+            )
+        })
+    })
 }
 
 fn with_connection<T>(db_path: &Path, action: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
@@ -437,7 +495,7 @@ fn fetch_terminal_legs(
 fn fetch_runway_ids_by_terminal_after_start(
     conn: &Connection,
     start_terminal_id: i64,
-) -> Result<HashMap<i64, i64>> {
+) -> Result<FxHashMap<i64, i64>> {
     let mut statement = conn
         .prepare("SELECT ID, RwyID FROM Terminals WHERE ID >= ? AND RwyID IS NOT NULL")
         .context("failed to query terminal runway ids")?;
@@ -446,7 +504,7 @@ fn fetch_runway_ids_by_terminal_after_start(
             Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
         })
         .context("failed to iterate terminal runway ids")?;
-    let mut runway_ids_by_terminal = HashMap::new();
+    let mut runway_ids_by_terminal = fast_hash_map();
     for row in rows {
         let (terminal_id, runway_id) = row.context("failed to read terminal runway id row")?;
         runway_ids_by_terminal.insert(terminal_id, runway_id);
@@ -454,97 +512,68 @@ fn fetch_runway_ids_by_terminal_after_start(
     Ok(runway_ids_by_terminal)
 }
 
-fn load_excluded_existing_terminal_ids(output_dir: &Path) -> Result<HashSet<i64>> {
+fn load_excluded_existing_terminal_ids(output_dir: &Path) -> Result<FxHashSet<i64>> {
     let path = output_dir.join("Terminals.json");
     if !path.exists() {
-        return Ok(HashSet::new());
+        return Ok(fast_hash_set());
     }
 
     let bytes = fs::read(&path)
         .with_context(|| format!("failed to read existing terminals json: {}", path.display()))?;
-    let rows: Vec<Map<String, Value>> = serde_json::from_slice(&bytes).with_context(|| {
-        format!(
-            "failed to parse existing terminals json: {}",
-            path.display()
-        )
-    })?;
+    let rows: Vec<ExistingTerminalFilterRow> =
+        serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "failed to parse existing terminals json: {}",
+                path.display()
+            )
+        })?;
 
     Ok(rows
         .into_iter()
-        .filter(is_excluded_terminal_row)
-        .filter_map(|row| json_to_i64(row.get("ID")))
+        .filter(|row| {
+            is_excluded_terminal(
+                row.icao.as_deref(),
+                row.name.as_deref(),
+                row.full_name.as_deref(),
+            )
+        })
+        .filter_map(|row| row.id)
         .collect())
 }
 
-fn fetch_all_terminal_ids(conn: &Connection) -> Result<HashSet<i64>> {
+fn fetch_all_terminal_ids(conn: &Connection) -> Result<FxHashSet<i64>> {
     let mut statement = conn
         .prepare("SELECT ID FROM Terminals")
         .context("failed to query terminal ids")?;
     let rows = statement
         .query_map([], |row| row.get::<_, i64>(0))
         .context("failed to iterate terminal ids")?;
-    rows.collect::<rusqlite::Result<HashSet<_>>>()
+    rows.collect::<rusqlite::Result<FxHashSet<_>>>()
         .context("failed to read terminal ids")
 }
 
-struct TerminalJobIter<'a> {
-    legs: std::vec::IntoIter<TerminalLegRecord>,
-    buffered: Option<TerminalLegRecord>,
-    runway_ids_by_terminal: &'a HashMap<i64, i64>,
-    runway_coords: &'a HashMap<i64, (f64, f64)>,
-    waypoint_coords: &'a HashMap<i64, (f64, f64)>,
-    navaid_coords: &'a HashMap<i64, (f64, f64)>,
-}
+fn group_terminal_legs_by_terminal(
+    terminal_legs: Vec<TerminalLegRecord>,
+) -> Vec<(i64, Vec<TerminalLegRecord>)> {
+    let mut groups = Vec::new();
+    let mut legs = terminal_legs.into_iter();
+    let Some(first) = legs.next() else {
+        return groups;
+    };
 
-impl<'a> TerminalJobIter<'a> {
-    fn new(
-        legs: Vec<TerminalLegRecord>,
-        runway_ids_by_terminal: &'a HashMap<i64, i64>,
-        runway_coords: &'a HashMap<i64, (f64, f64)>,
-        waypoint_coords: &'a HashMap<i64, (f64, f64)>,
-        navaid_coords: &'a HashMap<i64, (f64, f64)>,
-    ) -> Self {
-        Self {
-            legs: legs.into_iter(),
-            buffered: None,
-            runway_ids_by_terminal,
-            runway_coords,
-            waypoint_coords,
-            navaid_coords,
+    let mut current_terminal_id = first.terminal_id;
+    let mut current_group = vec![first];
+    for leg in legs {
+        if leg.terminal_id != current_terminal_id {
+            groups.push((current_terminal_id, current_group));
+            current_terminal_id = leg.terminal_id;
+            current_group = vec![leg];
+        } else {
+            current_group.push(leg);
         }
     }
-}
-
-impl Iterator for TerminalJobIter<'_> {
-    type Item = (i64, Vec<TerminalLegRecord>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut first = self.buffered.take().or_else(|| self.legs.next())?;
-        first.fill_coordinates(
-            self.runway_ids_by_terminal,
-            self.runway_coords,
-            self.waypoint_coords,
-            self.navaid_coords,
-        );
-        let terminal_id = first.terminal_id;
-        let mut group = vec![first];
-
-        for mut leg in self.legs.by_ref() {
-            if leg.terminal_id != terminal_id {
-                self.buffered = Some(leg);
-                break;
-            }
-            leg.fill_coordinates(
-                self.runway_ids_by_terminal,
-                self.runway_coords,
-                self.waypoint_coords,
-                self.navaid_coords,
-            );
-            group.push(leg);
-        }
-
-        Some((terminal_id, group))
-    }
+    groups.push((current_terminal_id, current_group));
+    groups
 }
 
 fn procedure_dir_has_existing_files_from(output_dir: &Path, min_terminal_id: i64) -> Result<bool> {
@@ -587,7 +616,7 @@ fn procedure_dir_has_existing_files_from(output_dir: &Path, min_terminal_id: i64
 
 fn cleanup_extra_procedure_files(
     output_dir: &Path,
-    allowed_terminal_ids: &HashSet<i64>,
+    allowed_terminal_ids: &FxHashSet<i64>,
 ) -> Result<usize> {
     let procedure_dir = output_dir.join("ProcedureLegs");
     let mut removed = 0;
@@ -634,8 +663,8 @@ fn cleanup_extra_procedure_files(
     Ok(removed)
 }
 
-fn collect_waypoint_reference_ids(terminal_legs: &[TerminalLegRecord]) -> HashSet<i64> {
-    let mut ids = HashSet::new();
+fn collect_waypoint_reference_ids(terminal_legs: &[TerminalLegRecord]) -> FxHashSet<i64> {
+    let mut ids = fast_hash_set();
     for leg in terminal_legs {
         if let Some(id) = leg.wpt_id_num {
             ids.insert(id);
@@ -647,8 +676,8 @@ fn collect_waypoint_reference_ids(terminal_legs: &[TerminalLegRecord]) -> HashSe
     ids
 }
 
-fn collect_navaid_reference_ids(terminal_legs: &[TerminalLegRecord]) -> HashSet<i64> {
-    let mut ids = HashSet::new();
+fn collect_navaid_reference_ids(terminal_legs: &[TerminalLegRecord]) -> FxHashSet<i64> {
+    let mut ids = fast_hash_set();
     for leg in terminal_legs {
         if let Some(id) = leg.nav_id_num {
             ids.insert(id);
@@ -659,9 +688,9 @@ fn collect_navaid_reference_ids(terminal_legs: &[TerminalLegRecord]) -> HashSet<
 
 fn fetch_waypoint_coordinates_by_db_ids(
     conn: &Connection,
-    db_ids: &HashSet<i64>,
+    db_ids: &FxHashSet<i64>,
     waypoint_id_index: &WaypointIdIndex,
-) -> Result<HashMap<i64, (f64, f64)>> {
+) -> Result<FxHashMap<i64, (f64, f64)>> {
     fetch_output_coordinates_by_db_ids(conn, "Waypoints", db_ids, |db_id| {
         waypoint_id_index.output_id_for_db(db_id)
     })
@@ -669,9 +698,9 @@ fn fetch_waypoint_coordinates_by_db_ids(
 
 fn fetch_navaid_coordinates_by_db_ids(
     conn: &Connection,
-    db_ids: &HashSet<i64>,
+    db_ids: &FxHashSet<i64>,
     navaid_id_index: &NavaidIdIndex,
-) -> Result<HashMap<i64, (f64, f64)>> {
+) -> Result<FxHashMap<i64, (f64, f64)>> {
     fetch_output_coordinates_by_db_ids(conn, "Navaids", db_ids, |db_id| {
         navaid_id_index.output_id_for_db(db_id)
     })
@@ -679,22 +708,22 @@ fn fetch_navaid_coordinates_by_db_ids(
 
 fn fetch_runway_coordinates_by_ids(
     conn: &Connection,
-    ids: &HashSet<i64>,
-) -> Result<HashMap<i64, (f64, f64)>> {
+    ids: &FxHashSet<i64>,
+) -> Result<FxHashMap<i64, (f64, f64)>> {
     fetch_coordinates_by_ids(conn, "Runways", ids)
 }
 
 fn fetch_coordinates_by_ids(
     conn: &Connection,
     table_name: &str,
-    ids: &HashSet<i64>,
-) -> Result<HashMap<i64, (f64, f64)>> {
+    ids: &FxHashSet<i64>,
+) -> Result<FxHashMap<i64, (f64, f64)>> {
     if ids.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(fast_hash_map());
     }
 
     let longitude_col = resolve_longitude_column(conn, table_name)?;
-    let mut map = HashMap::new();
+    let mut map = fast_hash_map_with_capacity(ids.len());
 
     let mut id_list: Vec<i64> = ids.iter().copied().collect();
     id_list.sort_unstable();
@@ -734,11 +763,11 @@ fn fetch_coordinates_by_ids(
 fn fetch_output_coordinates_by_db_ids(
     conn: &Connection,
     table_name: &str,
-    db_ids: &HashSet<i64>,
+    db_ids: &FxHashSet<i64>,
     map_id: impl Fn(i64) -> i64,
-) -> Result<HashMap<i64, (f64, f64)>> {
+) -> Result<FxHashMap<i64, (f64, f64)>> {
     let raw_coords = fetch_coordinates_by_ids(conn, table_name, db_ids)?;
-    let mut remapped = HashMap::with_capacity(raw_coords.len());
+    let mut remapped = fast_hash_map_with_capacity(raw_coords.len());
     for (db_id, coords) in raw_coords {
         remapped.entry(map_id(db_id)).or_insert(coords);
     }
@@ -879,7 +908,7 @@ mod tests {
         fs::write(&remove_path, "[]").expect("write stale file");
         fs::write(&ignored_path, "[]").expect("write ignored file");
 
-        let allowed = HashSet::from([100_i64]);
+        let allowed: FxHashSet<i64> = [100_i64].into_iter().collect();
         let removed = cleanup_extra_procedure_files(&output_dir, &allowed).expect("cleanup files");
 
         assert_eq!(removed, 1);

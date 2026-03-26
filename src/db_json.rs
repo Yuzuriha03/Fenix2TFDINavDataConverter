@@ -261,30 +261,6 @@ pub(crate) fn write_json_objects_with_buffer<T: Serialize>(
     Ok(())
 }
 
-pub(crate) fn write_json_objects_if_changed_with_buffer<T: Serialize>(
-    path: &Path,
-    rows: &[T],
-    buffer_capacity: usize,
-) -> Result<bool> {
-    if !path.exists() {
-        write_json_objects_with_buffer(path, rows, buffer_capacity)?;
-        return Ok(true);
-    }
-
-    let encoded = serde_json::to_vec(rows)
-        .with_context(|| format!("failed to encode json objects: {}", path.display()))?;
-
-    if let Ok(existing) = fs::read(path)
-        && existing == encoded
-    {
-        return Ok(false);
-    }
-
-    fs::write(path, encoded)
-        .with_context(|| format!("failed to write json objects: {}", path.display()))?;
-    Ok(true)
-}
-
 pub(crate) fn read_text_gbk(path: &Path) -> Result<String> {
     let bytes =
         fs::read(path).with_context(|| format!("failed to read file: {}", path.display()))?;

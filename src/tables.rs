@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
@@ -8,6 +8,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use rusqlite::Connection;
+use rustc_hash::FxHashSet;
 use serde_json::{Map, Value};
 
 use crate::db_json::{
@@ -19,7 +20,7 @@ use crate::stats::{PhaseDurations, TableExportStats, TableTimingBreakdown};
 #[derive(Clone, Debug)]
 pub(crate) struct ExistingJsonIndex {
     pub(crate) path: PathBuf,
-    pub(crate) ids: HashSet<i64>,
+    pub(crate) ids: FxHashSet<i64>,
     pub(crate) row_count: usize,
 }
 
@@ -40,6 +41,10 @@ struct JsonArrayBounds {
     first_non_ws: usize,
     last_non_ws: usize,
     has_existing_items: bool,
+}
+
+fn fast_hash_set<T>() -> FxHashSet<T> {
+    FxHashSet::default()
 }
 
 pub(crate) fn export_table_to_json(
@@ -188,9 +193,9 @@ pub(crate) fn export_preformatted_rows_to_json(
     })
 }
 
-fn scan_json_id_index(bytes: &[u8]) -> (HashSet<i64>, usize) {
+fn scan_json_id_index(bytes: &[u8]) -> (FxHashSet<i64>, usize) {
     const ID_KEY: &[u8] = b"\"ID\":";
-    let mut ids = HashSet::new();
+    let mut ids = fast_hash_set();
     let mut row_count = 0usize;
 
     for byte in bytes {

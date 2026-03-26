@@ -1,4 +1,3 @@
-use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
@@ -6,6 +5,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::{Map, Number, Value};
 
 use crate::db_json::{
@@ -20,7 +20,7 @@ use crate::terminal_filters::is_excluded_terminal_row;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ReferenceIdIndex {
-    output_id_by_db_id: HashMap<i64, i64>,
+    output_id_by_db_id: FxHashMap<i64, i64>,
     db_row_count: usize,
 }
 
@@ -48,6 +48,14 @@ impl ReferenceIdIndex {
 struct ForeignKeyRemap<'a> {
     column_name: &'a str,
     index: &'a ReferenceIdIndex,
+}
+
+fn fast_hash_map_with_capacity<K, V>(capacity: usize) -> FxHashMap<K, V> {
+    FxHashMap::with_capacity_and_hasher(capacity, Default::default())
+}
+
+fn fast_hash_set<T>() -> FxHashSet<T> {
+    FxHashSet::default()
 }
 
 pub(crate) fn build_airport_id_index(
@@ -359,7 +367,7 @@ fn build_filtered_terminal_rows(
     let existing_ids = kept_existing_rows
         .iter()
         .filter_map(|row| json_to_i64(row.get("ID")))
-        .collect::<HashSet<_>>();
+        .collect::<FxHashSet<_>>();
 
     let mut appended_rows = db_rows
         .into_iter()
@@ -426,9 +434,11 @@ fn export_reference_table(
     let source_rows = rows.len();
 
     let format_start = Instant::now();
-    let mut seen_output_ids = existing_merge
+    let mut seen_output_ids: FxHashSet<i64> = existing_merge
         .as_ref()
-        .map_or_else(HashSet::new, |existing| existing.ids.clone());
+        .map_or_else(fast_hash_set, |existing| {
+            existing.ids.iter().copied().collect()
+        });
     let formatted_rows = rows
         .into_iter()
         .filter_map(|mut row| {
@@ -464,7 +474,7 @@ fn fetch_reference_rows(
     foreign_key_remaps: &[ForeignKeyRemap<'_>],
 ) -> Result<Vec<Map<String, Value>>> {
     let db_rows = fetch_table_rows(conn, table_name)?;
-    let mut seen_output_ids = HashSet::new();
+    let mut seen_output_ids: FxHashSet<i64> = fast_hash_set();
     let mut rows = Vec::with_capacity(db_rows.len());
 
     for mut row in db_rows {
@@ -530,8 +540,11 @@ fn build_reference_id_index_from_rows(
     existing_rows: &[Map<String, Value>],
     key_columns: &[&str],
 ) -> ReferenceIdIndex {
-    let mut existing_id_by_key = HashMap::new();
-    let mut used_ids = HashSet::new();
+    let mut existing_id_by_key = fast_hash_map_with_capacity(existing_rows.len());
+    let mut used_ids: FxHashSet<i64> = FxHashSet::with_capacity_and_hasher(
+        existing_rows.len() + db_rows.len(),
+        Default::default(),
+    );
 
     for row in existing_rows {
         let Some(existing_id) = json_to_i64(row.get("ID")) else {
@@ -550,7 +563,7 @@ fn build_reference_id_index_from_rows(
         .max()
         .unwrap_or_default();
     let mut next_generated_id = max_existing_id.max(max_db_id);
-    let mut output_id_by_db_id = HashMap::with_capacity(db_rows.len());
+    let mut output_id_by_db_id = fast_hash_map_with_capacity(db_rows.len());
 
     for row in db_rows {
         let Some(db_id) = json_to_i64(row.get("ID")) else {
@@ -584,7 +597,7 @@ fn build_reference_id_index_from_rows(
     }
 }
 
-fn next_unused_id(next_generated_id: &mut i64, used_ids: &HashSet<i64>) -> i64 {
+fn next_unused_id(next_generated_id: &mut i64, used_ids: &FxHashSet<i64>) -> i64 {
     loop {
         *next_generated_id = next_generated_id.saturating_add(1);
         if !used_ids.contains(next_generated_id) {

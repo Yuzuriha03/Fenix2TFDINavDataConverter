@@ -1,7 +1,6 @@
 mod merge;
 pub mod rte_seg;
 
-use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
@@ -9,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
-use serde::Deserialize;
-use serde_json::{Map, Number, Value};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use serde::{Deserialize, Serialize};
 
 use crate::db_json::write_json_objects;
 use crate::stats::{AirwayTimingBreakdown, PhaseDurations, TableExportStats};
@@ -23,10 +22,25 @@ pub(crate) use rte_seg::WaypointCandidate;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AirwayMirrorReference {
-    pub(super) mirrored_edge_keys: HashSet<String>,
+    pub(super) mirrored_pairs_by_ident: HashMap<String, HashMap<String, HashSet<String>>>,
 }
 
 impl AirwayMirrorReference {
+    pub(super) fn insert_mirrored_pair(
+        &mut self,
+        ident: String,
+        waypoint1: String,
+        waypoint2: String,
+    ) {
+        let (left, right) = ordered_pair_owned(waypoint1, waypoint2);
+        self.mirrored_pairs_by_ident
+            .entry(ident)
+            .or_default()
+            .entry(left)
+            .or_default()
+            .insert(right);
+    }
+
     pub(super) fn should_mirror(
         &self,
         ident: &str,
@@ -34,8 +48,11 @@ impl AirwayMirrorReference {
         waypoint1: &str,
         waypoint2: &str,
     ) -> bool {
-        self.mirrored_edge_keys
-            .contains(&undirected_airway_route_key(ident, waypoint1, waypoint2))
+        let (left, right) = ordered_pair_ref(waypoint1, waypoint2);
+        self.mirrored_pairs_by_ident
+            .get(ident)
+            .and_then(|pairs_by_left| pairs_by_left.get(left))
+            .is_some_and(|rights| rights.contains(right))
     }
 }
 
@@ -54,6 +71,36 @@ pub(crate) struct PreloadedAirwayReferenceJson {
 
 pub(crate) type PreloadedWaypointCandidates = HashMap<String, Vec<WaypointCandidate>>;
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct AirwayOutputRow {
+    #[serde(rename = "ID")]
+    pub(super) id: i64,
+    #[serde(rename = "Ident")]
+    pub(super) ident: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct AirwayLegOutputRow {
+    #[serde(rename = "ID")]
+    pub(super) id: i64,
+    #[serde(rename = "AirwayID")]
+    pub(super) airway_id: i64,
+    #[serde(rename = "Level")]
+    pub(super) level: String,
+    #[serde(rename = "Waypoint1ID")]
+    pub(super) waypoint1_id: Option<i64>,
+    #[serde(rename = "Waypoint2ID")]
+    pub(super) waypoint2_id: Option<i64>,
+    #[serde(rename = "IsStart")]
+    pub(super) is_start: i64,
+    #[serde(rename = "IsEnd")]
+    pub(super) is_end: i64,
+    #[serde(rename = "Waypoint1")]
+    pub(super) waypoint1: String,
+    #[serde(rename = "Waypoint2")]
+    pub(super) waypoint2: String,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct AirwayReferenceRow {
     #[serde(rename = "ID")]
@@ -63,11 +110,11 @@ pub(crate) struct AirwayReferenceRow {
 }
 
 impl AirwayReferenceRow {
-    pub(super) fn to_map_with_id(&self, id: i64) -> Map<String, Value> {
-        let mut row = Map::with_capacity(2);
-        row.insert("ID".to_string(), Value::Number(Number::from(id)));
-        row.insert("Ident".to_string(), Value::String(self.ident.clone()));
-        row
+    pub(super) fn to_output_with_id(&self, id: i64) -> AirwayOutputRow {
+        AirwayOutputRow {
+            id,
+            ident: self.ident.clone(),
+        }
     }
 }
 
@@ -94,39 +141,18 @@ pub(crate) struct AirwayLegReferenceRow {
 }
 
 impl AirwayLegReferenceRow {
-    pub(super) fn to_map_with_ids(&self, id: i64, airway_id: i64) -> Map<String, Value> {
-        let mut row = Map::with_capacity(9);
-        row.insert("ID".to_string(), Value::Number(Number::from(id)));
-        row.insert(
-            "AirwayID".to_string(),
-            Value::Number(Number::from(airway_id)),
-        );
-        row.insert("Level".to_string(), Value::String(self.level.clone()));
-        row.insert(
-            "Waypoint1".to_string(),
-            Value::String(self.waypoint1.clone()),
-        );
-        row.insert(
-            "Waypoint2".to_string(),
-            Value::String(self.waypoint2.clone()),
-        );
-        row.insert(
-            "Waypoint1ID".to_string(),
-            Value::Number(Number::from(self.waypoint1_id)),
-        );
-        row.insert(
-            "Waypoint2ID".to_string(),
-            Value::Number(Number::from(self.waypoint2_id)),
-        );
-        row.insert(
-            "IsStart".to_string(),
-            Value::Number(Number::from(self.is_start)),
-        );
-        row.insert(
-            "IsEnd".to_string(),
-            Value::Number(Number::from(self.is_end)),
-        );
-        row
+    pub(super) fn to_output_with_ids(&self, id: i64, airway_id: i64) -> AirwayLegOutputRow {
+        AirwayLegOutputRow {
+            id,
+            airway_id,
+            level: self.level.clone(),
+            waypoint1: self.waypoint1.clone(),
+            waypoint2: self.waypoint2.clone(),
+            waypoint1_id: Some(self.waypoint1_id),
+            waypoint2_id: Some(self.waypoint2_id),
+            is_start: self.is_start,
+            is_end: self.is_end,
+        }
     }
 }
 
@@ -409,11 +435,19 @@ pub fn directed_airway_route_key(ident: &str, waypoint1: &str, waypoint2: &str) 
     format!("{ident}\u{1f}|{waypoint1}\u{1f}|{waypoint2}")
 }
 
-fn undirected_airway_route_key(ident: &str, waypoint1: &str, waypoint2: &str) -> String {
-    if waypoint1 <= waypoint2 {
-        directed_airway_route_key(ident, waypoint1, waypoint2)
+fn ordered_pair_ref<'a>(left: &'a str, right: &'a str) -> (&'a str, &'a str) {
+    if left <= right {
+        (left, right)
     } else {
-        directed_airway_route_key(ident, waypoint2, waypoint1)
+        (right, left)
+    }
+}
+
+fn ordered_pair_owned(left: String, right: String) -> (String, String) {
+    if left <= right {
+        (left, right)
+    } else {
+        (right, left)
     }
 }
 
@@ -448,4 +482,20 @@ pub(crate) fn preload_waypoint_candidates(
     preloaded_rte_seg: &PreloadedRteSegData,
 ) -> Result<PreloadedWaypointCandidates> {
     rte_seg::load_waypoint_candidates_from_db(db_path, &preloaded_rte_seg.required_waypoint_idents)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AirwayMirrorReference;
+
+    #[test]
+    fn mirror_reference_matches_both_directions_without_rebuilding_global_keys() {
+        let mut reference = AirwayMirrorReference::default();
+        reference.insert_mirrored_pair("H100".to_string(), "C".to_string(), "A".to_string());
+
+        assert!(reference.should_mirror("H100", "B", "A", "C"));
+        assert!(reference.should_mirror("H100", "B", "C", "A"));
+        assert!(!reference.should_mirror("H100", "B", "A", "D"));
+        assert!(!reference.should_mirror("H200", "B", "A", "C"));
+    }
 }

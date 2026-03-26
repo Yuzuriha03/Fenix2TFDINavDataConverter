@@ -1,21 +1,34 @@
-use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Cursor};
 use std::path::Path;
 
 use anyhow::{Result, anyhow, bail};
 use rusqlite::Connection;
 use rusqlite::params_from_iter;
-use serde_json::{Map, Number, Value};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::db_json::{
     configure_read_connection, extract_csv_fields_simple, read_text_gbk, trim_csv_field,
 };
 use crate::waypoints::WaypointIdIndex;
 
-use super::{AirwayMirrorReference, directed_airway_route_key};
+use super::{
+    AirwayLegOutputRow, AirwayMirrorReference, AirwayOutputRow, directed_airway_route_key,
+};
 
-type AirwayRows = Vec<Map<String, Value>>;
-type AirwayBuildOutput = (AirwayRows, AirwayRows);
+type AirwayBuildOutput = (Vec<AirwayOutputRow>, Vec<AirwayLegOutputRow>);
+type AirwayNodeKey = i64;
+
+fn fast_hash_map<K, V>() -> HashMap<K, V> {
+    HashMap::with_hasher(Default::default())
+}
+
+fn fast_hash_map_with_capacity<K, V>(capacity: usize) -> HashMap<K, V> {
+    HashMap::with_capacity_and_hasher(capacity, Default::default())
+}
+
+fn fast_hash_set<T>() -> HashSet<T> {
+    HashSet::with_hasher(Default::default())
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct PreloadedRteSegData {
@@ -73,18 +86,12 @@ struct DirectedAirwaySegment {
     end_id: i64,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct AirwayNodeKey {
-    ident: String,
-    waypoint_id: i64,
-}
-
 pub(super) fn load_waypoint_candidates_from_db(
     db_path: &Path,
     required_idents: &HashSet<String>,
 ) -> Result<HashMap<String, Vec<WaypointCandidate>>> {
     if required_idents.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(fast_hash_map());
     }
 
     let conn = Connection::open(db_path)?;
@@ -92,7 +99,8 @@ pub(super) fn load_waypoint_candidates_from_db(
 
     let longitude_col = resolve_waypoint_longitude_column(&conn)?;
 
-    let mut candidates: HashMap<String, Vec<WaypointCandidate>> = HashMap::new();
+    let mut candidates: HashMap<String, Vec<WaypointCandidate>> =
+        fast_hash_map_with_capacity(required_idents.len());
     let mut ident_list: Vec<String> = required_idents.iter().cloned().collect();
     ident_list.sort();
     for chunk in ident_list.chunks(900) {
@@ -133,7 +141,7 @@ pub(super) fn load_waypoint_candidates_from_db(
 }
 
 pub(super) fn collect_required_waypoint_idents(rows: &[ParsedRteSegAirwayRow]) -> HashSet<String> {
-    let mut idents = HashSet::new();
+    let mut idents = fast_hash_set();
     for row in rows {
         if !row.start_ident.trim().is_empty() {
             idents.insert(row.start_ident.clone());
@@ -174,7 +182,7 @@ pub(super) fn build_airway_tables_from_rows_with_id_index(
     waypoint_id_index: Option<&WaypointIdIndex>,
 ) -> AirwayBuildOutput {
     let mut ident_order = Vec::new();
-    let mut segments_by_ident: HashMap<String, Vec<DirectedAirwaySegment>> = HashMap::new();
+    let mut segments_by_ident: HashMap<String, Vec<DirectedAirwaySegment>> = fast_hash_map();
 
     for row in rows {
         let Some(segment) =
@@ -182,13 +190,12 @@ pub(super) fn build_airway_tables_from_rows_with_id_index(
         else {
             continue;
         };
-        if !segments_by_ident.contains_key(&segment.ident) {
-            ident_order.push(segment.ident.clone());
+        let ident = segment.ident.clone();
+        let entry = segments_by_ident.entry(ident.clone()).or_default();
+        if entry.is_empty() {
+            ident_order.push(ident);
         }
-        segments_by_ident
-            .entry(segment.ident.clone())
-            .or_default()
-            .push(segment);
+        entry.push(segment);
     }
 
     let mut next_airway_id = 1i64;
@@ -202,46 +209,25 @@ pub(super) fn build_airway_tables_from_rows_with_id_index(
         let airway_id = next_airway_id;
         next_airway_id += 1;
 
-        let mut airway_row = Map::new();
-        airway_row.insert("ID".to_string(), Value::Number(Number::from(airway_id)));
-        airway_row.insert("Ident".to_string(), Value::String(ident.clone()));
-        airways.push(airway_row);
+        airways.push(AirwayOutputRow {
+            id: airway_id,
+            ident: ident.clone(),
+        });
 
         for chain in split_rte_seg_segments_into_chains(segments) {
             for (index, segment) in chain.iter().enumerate() {
-                let mut leg_row = Map::new();
-                leg_row.insert("ID".to_string(), Value::Number(Number::from(next_leg_id)));
+                airway_legs.push(AirwayLegOutputRow {
+                    id: next_leg_id,
+                    airway_id,
+                    level: "B".to_string(),
+                    waypoint1: segment.start_ident.clone(),
+                    waypoint2: segment.end_ident.clone(),
+                    waypoint1_id: Some(segment.start_id),
+                    waypoint2_id: Some(segment.end_id),
+                    is_start: i64::from(index == 0),
+                    is_end: i64::from(index + 1 == chain.len()),
+                });
                 next_leg_id += 1;
-                leg_row.insert(
-                    "AirwayID".to_string(),
-                    Value::Number(Number::from(airway_id)),
-                );
-                leg_row.insert("Level".to_string(), Value::String("B".to_string()));
-                leg_row.insert(
-                    "Waypoint1ID".to_string(),
-                    Value::Number(Number::from(segment.start_id)),
-                );
-                leg_row.insert(
-                    "Waypoint2ID".to_string(),
-                    Value::Number(Number::from(segment.end_id)),
-                );
-                leg_row.insert(
-                    "IsStart".to_string(),
-                    Value::Number(Number::from(i32::from(index == 0))),
-                );
-                leg_row.insert(
-                    "IsEnd".to_string(),
-                    Value::Number(Number::from(i32::from(index + 1 == chain.len()))),
-                );
-                leg_row.insert(
-                    "Waypoint1".to_string(),
-                    Value::String(segment.start_ident.clone()),
-                );
-                leg_row.insert(
-                    "Waypoint2".to_string(),
-                    Value::String(segment.end_ident.clone()),
-                );
-                airway_legs.push(leg_row);
             }
         }
     }
@@ -323,9 +309,9 @@ fn split_rte_seg_segments_into_chains(
         return Vec::new();
     }
 
-    let mut outgoing_by_node: HashMap<AirwayNodeKey, Vec<usize>> = HashMap::new();
-    let mut incoming_count_by_node: HashMap<AirwayNodeKey, usize> = HashMap::new();
-    let mut outgoing_count_by_node: HashMap<AirwayNodeKey, usize> = HashMap::new();
+    let mut outgoing_by_node: HashMap<AirwayNodeKey, Vec<usize>> = fast_hash_map();
+    let mut incoming_count_by_node: HashMap<AirwayNodeKey, usize> = fast_hash_map();
+    let mut outgoing_count_by_node: HashMap<AirwayNodeKey, usize> = fast_hash_map();
 
     for (index, segment) in segments.iter().enumerate() {
         let start_node = segment_start_node(segment);
@@ -460,17 +446,11 @@ fn build_airway_segment_chain(
 }
 
 fn segment_start_node(segment: &DirectedAirwaySegment) -> AirwayNodeKey {
-    AirwayNodeKey {
-        ident: segment.start_ident.clone(),
-        waypoint_id: segment.start_id,
-    }
+    segment.start_id
 }
 
 fn segment_end_node(segment: &DirectedAirwaySegment) -> AirwayNodeKey {
-    AirwayNodeKey {
-        ident: segment.end_ident.clone(),
-        waypoint_id: segment.end_id,
-    }
+    segment.end_id
 }
 
 fn resolve_waypoint_id(
@@ -518,7 +498,7 @@ fn load_rte_seg_mirror_reference_from_bufread<R: BufRead>(
         return Ok(AirwayMirrorReference::default());
     }
     let [ident_idx, start_idx, end_idx, dir_idx] = parse_rte_seg_header_indices_simple(&line)?;
-    let mut directed_edges = HashSet::new();
+    let mut directed_edges = fast_hash_set();
     let mut normalized_edges = Vec::new();
 
     loop {
@@ -550,24 +530,19 @@ fn load_rte_seg_mirror_reference_from_bufread<R: BufRead>(
         normalized_edges.push((ident.to_string(), waypoint1, waypoint2));
     }
 
-    let mut mirrored_edge_keys = HashSet::new();
+    let mut mirror_reference = AirwayMirrorReference::default();
     for (ident, waypoint1, waypoint2) in normalized_edges {
         let reverse_key = directed_airway_route_key(&ident, &waypoint2, &waypoint1);
         if directed_edges.contains(&reverse_key) {
-            let key = if waypoint1 <= waypoint2 {
-                directed_airway_route_key(&ident, &waypoint1, &waypoint2)
-            } else {
-                directed_airway_route_key(&ident, &waypoint2, &waypoint1)
-            };
-            mirrored_edge_keys.insert(key);
+            mirror_reference.insert_mirrored_pair(ident, waypoint1, waypoint2);
         }
     }
-    Ok(AirwayMirrorReference { mirrored_edge_keys })
+    Ok(mirror_reference)
 }
 
 fn parse_rte_seg_header_indices_simple(line: &str) -> Result<[usize; 4]> {
     let header = line.strip_prefix('\u{feff}').unwrap_or(line);
-    let mut index_map = HashMap::new();
+    let mut index_map = fast_hash_map();
     for (idx, field) in header.trim_end_matches(['\r', '\n']).split(',').enumerate() {
         index_map.insert(trim_csv_field(field), idx);
     }
@@ -662,7 +637,7 @@ fn parse_rte_seg_airway_rows_from_bufread<R: BufRead>(
 
 fn parse_rte_seg_airway_header_indices_simple(line: &str) -> Result<[usize; 8]> {
     let header = line.strip_prefix('\u{feff}').unwrap_or(line);
-    let mut index_map = HashMap::new();
+    let mut index_map = fast_hash_map();
     for (idx, field) in header.trim_end_matches(['\r', '\n']).split(',').enumerate() {
         index_map.insert(trim_csv_field(field), idx);
     }
@@ -729,17 +704,6 @@ mod tests {
         }
     }
 
-    fn extract_leg_text(row: &Map<String, Value>, key: &str) -> String {
-        row.get(key)
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    }
-
-    fn extract_leg_i64(row: &Map<String, Value>, key: &str) -> i64 {
-        row.get(key).and_then(Value::as_i64).unwrap_or_default()
-    }
-
     #[test]
     fn builds_forward_airway_chain_with_single_start_and_end() {
         let rows = vec![
@@ -777,31 +741,33 @@ mod tests {
                 direction: RteSegDirection::Forward,
             },
         ];
-        let waypoint_candidates = HashMap::from([
+        let waypoint_candidates: HashMap<String, Vec<WaypointCandidate>> = [
             ("A".to_string(), vec![candidate(1)]),
             ("B".to_string(), vec![candidate(2)]),
             ("C".to_string(), vec![candidate(3)]),
             ("D".to_string(), vec![candidate(4)]),
-        ]);
+        ]
+        .into_iter()
+        .collect();
 
         let (_airways, legs) =
             build_airway_tables_from_rows_with_id_index(&rows, &waypoint_candidates, None);
 
         assert_eq!(legs.len(), 3);
-        assert_eq!(extract_leg_text(&legs[0], "Waypoint1"), "A");
-        assert_eq!(extract_leg_text(&legs[0], "Waypoint2"), "B");
-        assert_eq!(extract_leg_i64(&legs[0], "IsStart"), 1);
-        assert_eq!(extract_leg_i64(&legs[0], "IsEnd"), 0);
+        assert_eq!(legs[0].waypoint1, "A");
+        assert_eq!(legs[0].waypoint2, "B");
+        assert_eq!(legs[0].is_start, 1);
+        assert_eq!(legs[0].is_end, 0);
 
-        assert_eq!(extract_leg_text(&legs[1], "Waypoint1"), "B");
-        assert_eq!(extract_leg_text(&legs[1], "Waypoint2"), "C");
-        assert_eq!(extract_leg_i64(&legs[1], "IsStart"), 0);
-        assert_eq!(extract_leg_i64(&legs[1], "IsEnd"), 0);
+        assert_eq!(legs[1].waypoint1, "B");
+        assert_eq!(legs[1].waypoint2, "C");
+        assert_eq!(legs[1].is_start, 0);
+        assert_eq!(legs[1].is_end, 0);
 
-        assert_eq!(extract_leg_text(&legs[2], "Waypoint1"), "C");
-        assert_eq!(extract_leg_text(&legs[2], "Waypoint2"), "D");
-        assert_eq!(extract_leg_i64(&legs[2], "IsStart"), 0);
-        assert_eq!(extract_leg_i64(&legs[2], "IsEnd"), 1);
+        assert_eq!(legs[2].waypoint1, "C");
+        assert_eq!(legs[2].waypoint2, "D");
+        assert_eq!(legs[2].is_start, 0);
+        assert_eq!(legs[2].is_end, 1);
     }
 
     #[test]
@@ -852,37 +818,39 @@ mod tests {
                 direction: RteSegDirection::Reverse,
             },
         ];
-        let waypoint_candidates = HashMap::from([
+        let waypoint_candidates: HashMap<String, Vec<WaypointCandidate>> = [
             ("ELNEX".to_string(), vec![candidate(1)]),
             ("P643".to_string(), vec![candidate(2)]),
             ("P644".to_string(), vec![candidate(3)]),
             ("P645".to_string(), vec![candidate(4)]),
             ("P652".to_string(), vec![candidate(5)]),
-        ]);
+        ]
+        .into_iter()
+        .collect();
 
         let (_airways, legs) =
             build_airway_tables_from_rows_with_id_index(&rows, &waypoint_candidates, None);
 
         assert_eq!(legs.len(), 4);
-        assert_eq!(extract_leg_text(&legs[0], "Waypoint1"), "P652");
-        assert_eq!(extract_leg_text(&legs[0], "Waypoint2"), "P645");
-        assert_eq!(extract_leg_i64(&legs[0], "IsStart"), 1);
-        assert_eq!(extract_leg_i64(&legs[0], "IsEnd"), 0);
+        assert_eq!(legs[0].waypoint1, "P652");
+        assert_eq!(legs[0].waypoint2, "P645");
+        assert_eq!(legs[0].is_start, 1);
+        assert_eq!(legs[0].is_end, 0);
 
-        assert_eq!(extract_leg_text(&legs[1], "Waypoint1"), "P645");
-        assert_eq!(extract_leg_text(&legs[1], "Waypoint2"), "P644");
-        assert_eq!(extract_leg_i64(&legs[1], "IsStart"), 0);
-        assert_eq!(extract_leg_i64(&legs[1], "IsEnd"), 0);
+        assert_eq!(legs[1].waypoint1, "P645");
+        assert_eq!(legs[1].waypoint2, "P644");
+        assert_eq!(legs[1].is_start, 0);
+        assert_eq!(legs[1].is_end, 0);
 
-        assert_eq!(extract_leg_text(&legs[2], "Waypoint1"), "P644");
-        assert_eq!(extract_leg_text(&legs[2], "Waypoint2"), "P643");
-        assert_eq!(extract_leg_i64(&legs[2], "IsStart"), 0);
-        assert_eq!(extract_leg_i64(&legs[2], "IsEnd"), 0);
+        assert_eq!(legs[2].waypoint1, "P644");
+        assert_eq!(legs[2].waypoint2, "P643");
+        assert_eq!(legs[2].is_start, 0);
+        assert_eq!(legs[2].is_end, 0);
 
-        assert_eq!(extract_leg_text(&legs[3], "Waypoint1"), "P643");
-        assert_eq!(extract_leg_text(&legs[3], "Waypoint2"), "ELNEX");
-        assert_eq!(extract_leg_i64(&legs[3], "IsStart"), 0);
-        assert_eq!(extract_leg_i64(&legs[3], "IsEnd"), 1);
+        assert_eq!(legs[3].waypoint1, "P643");
+        assert_eq!(legs[3].waypoint2, "ELNEX");
+        assert_eq!(legs[3].is_start, 0);
+        assert_eq!(legs[3].is_end, 1);
     }
 
     #[test]
@@ -922,31 +890,33 @@ mod tests {
                 direction: RteSegDirection::Reverse,
             },
         ];
-        let waypoint_candidates = HashMap::from([
+        let waypoint_candidates: HashMap<String, Vec<WaypointCandidate>> = [
             ("ANLAM".to_string(), vec![candidate(1)]),
             ("IGUNI".to_string(), vec![candidate(2)]),
             ("WLY".to_string(), vec![candidate(3)]),
             ("VEDPO".to_string(), vec![candidate(4)]),
-        ]);
+        ]
+        .into_iter()
+        .collect();
 
         let (_airways, legs) =
             build_airway_tables_from_rows_with_id_index(&rows, &waypoint_candidates, None);
 
         assert_eq!(legs.len(), 3);
 
-        assert_eq!(extract_leg_text(&legs[0], "Waypoint1"), "ANLAM");
-        assert_eq!(extract_leg_text(&legs[0], "Waypoint2"), "IGUNI");
-        assert_eq!(extract_leg_i64(&legs[0], "IsStart"), 1);
-        assert_eq!(extract_leg_i64(&legs[0], "IsEnd"), 0);
+        assert_eq!(legs[0].waypoint1, "ANLAM");
+        assert_eq!(legs[0].waypoint2, "IGUNI");
+        assert_eq!(legs[0].is_start, 1);
+        assert_eq!(legs[0].is_end, 0);
 
-        assert_eq!(extract_leg_text(&legs[1], "Waypoint1"), "IGUNI");
-        assert_eq!(extract_leg_text(&legs[1], "Waypoint2"), "WLY");
-        assert_eq!(extract_leg_i64(&legs[1], "IsStart"), 0);
-        assert_eq!(extract_leg_i64(&legs[1], "IsEnd"), 1);
+        assert_eq!(legs[1].waypoint1, "IGUNI");
+        assert_eq!(legs[1].waypoint2, "WLY");
+        assert_eq!(legs[1].is_start, 0);
+        assert_eq!(legs[1].is_end, 1);
 
-        assert_eq!(extract_leg_text(&legs[2], "Waypoint1"), "VEDPO");
-        assert_eq!(extract_leg_text(&legs[2], "Waypoint2"), "WLY");
-        assert_eq!(extract_leg_i64(&legs[2], "IsStart"), 1);
-        assert_eq!(extract_leg_i64(&legs[2], "IsEnd"), 1);
+        assert_eq!(legs[2].waypoint1, "VEDPO");
+        assert_eq!(legs[2].waypoint2, "WLY");
+        assert_eq!(legs[2].is_start, 1);
+        assert_eq!(legs[2].is_end, 1);
     }
 }

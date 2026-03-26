@@ -796,11 +796,23 @@ fn build_reference_id_indices(
     db_path: &Path,
     base_json_dir: Option<&Path>,
 ) -> Result<ReferenceIdIndices> {
-    let airport = build_airport_id_index(db_path, base_json_dir)?;
-    let runway = build_runway_id_index(db_path, base_json_dir, &airport)?;
-    let ils = build_ils_id_index(db_path, base_json_dir, &runway)?;
-    let waypoint = build_waypoint_id_index(db_path, base_json_dir)?;
-    let navaid = build_navaid_id_index(db_path, base_json_dir)?;
+    let (airport_chain_result, waypoint_and_navaid_result) = rayon::join(
+        || {
+            let airport = build_airport_id_index(db_path, base_json_dir)?;
+            let runway = build_runway_id_index(db_path, base_json_dir, &airport)?;
+            let ils = build_ils_id_index(db_path, base_json_dir, &runway)?;
+            Ok::<_, anyhow::Error>((airport, runway, ils))
+        },
+        || {
+            let (waypoint, navaid) = rayon::join(
+                || build_waypoint_id_index(db_path, base_json_dir),
+                || build_navaid_id_index(db_path, base_json_dir),
+            );
+            Ok::<_, anyhow::Error>((waypoint?, navaid?))
+        },
+    );
+    let (airport, runway, ils) = airport_chain_result?;
+    let (waypoint, navaid) = waypoint_and_navaid_result?;
 
     Ok(ReferenceIdIndices {
         airport,

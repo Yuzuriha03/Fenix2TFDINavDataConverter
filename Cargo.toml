@@ -16,5 +16,10 @@ anyhow = "1.0"
 encoding_rs = "0.8"
 rayon = "1.10"
 rusqlite = { version = "0.39", features = ["bundled"] }
+rustc-hash = "2.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
