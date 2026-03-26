@@ -10,6 +10,7 @@ use serde_json::{Map, Number, Value};
 use crate::db_json::{
     configure_read_connection, extract_csv_fields_simple, read_text_gbk, trim_csv_field,
 };
+use crate::waypoints::WaypointIdIndex;
 
 use super::{AirwayMirrorReference, directed_airway_route_key};
 
@@ -167,15 +168,18 @@ fn resolve_waypoint_longitude_column(conn: &Connection) -> Result<&'static str> 
     }
 }
 
-pub(super) fn build_airway_tables_from_rows(
+pub(super) fn build_airway_tables_from_rows_with_id_index(
     rows: &[ParsedRteSegAirwayRow],
     waypoint_candidates: &HashMap<String, Vec<WaypointCandidate>>,
+    waypoint_id_index: Option<&WaypointIdIndex>,
 ) -> AirwayBuildOutput {
     let mut ident_order = Vec::new();
     let mut segments_by_ident: HashMap<String, Vec<DirectedAirwaySegment>> = HashMap::new();
 
     for row in rows {
-        let Some(segment) = normalize_rte_seg_airway_row(row, waypoint_candidates) else {
+        let Some(segment) =
+            normalize_rte_seg_airway_row(row, waypoint_candidates, waypoint_id_index)
+        else {
             continue;
         };
         if !segments_by_ident.contains_key(&segment.ident) {
@@ -269,6 +273,7 @@ pub(crate) fn preload_rte_seg(rte_seg_path: &Path) -> Result<PreloadedRteSegData
 fn normalize_rte_seg_airway_row(
     row: &ParsedRteSegAirwayRow,
     waypoint_candidates: &HashMap<String, Vec<WaypointCandidate>>,
+    waypoint_id_index: Option<&WaypointIdIndex>,
 ) -> Option<DirectedAirwaySegment> {
     let (start_ident, start_latitude, start_longitude, end_ident, end_latitude, end_longitude) =
         match row.direction {
@@ -296,8 +301,10 @@ fn normalize_rte_seg_airway_row(
         start_ident,
         start_latitude,
         start_longitude,
-    )?;
-    let end_id = resolve_waypoint_id(waypoint_candidates, end_ident, end_latitude, end_longitude)?;
+    )
+    .map(|id| waypoint_id_index.map_or(id, |index| index.output_id_for_db(id)))?;
+    let end_id = resolve_waypoint_id(waypoint_candidates, end_ident, end_latitude, end_longitude)
+        .map(|id| waypoint_id_index.map_or(id, |index| index.output_id_for_db(id)))?;
 
     Some(DirectedAirwaySegment {
         ident: row.ident.clone(),
@@ -777,7 +784,8 @@ mod tests {
             ("D".to_string(), vec![candidate(4)]),
         ]);
 
-        let (_airways, legs) = build_airway_tables_from_rows(&rows, &waypoint_candidates);
+        let (_airways, legs) =
+            build_airway_tables_from_rows_with_id_index(&rows, &waypoint_candidates, None);
 
         assert_eq!(legs.len(), 3);
         assert_eq!(extract_leg_text(&legs[0], "Waypoint1"), "A");
@@ -852,7 +860,8 @@ mod tests {
             ("P652".to_string(), vec![candidate(5)]),
         ]);
 
-        let (_airways, legs) = build_airway_tables_from_rows(&rows, &waypoint_candidates);
+        let (_airways, legs) =
+            build_airway_tables_from_rows_with_id_index(&rows, &waypoint_candidates, None);
 
         assert_eq!(legs.len(), 4);
         assert_eq!(extract_leg_text(&legs[0], "Waypoint1"), "P652");
@@ -920,7 +929,8 @@ mod tests {
             ("VEDPO".to_string(), vec![candidate(4)]),
         ]);
 
-        let (_airways, legs) = build_airway_tables_from_rows(&rows, &waypoint_candidates);
+        let (_airways, legs) =
+            build_airway_tables_from_rows_with_id_index(&rows, &waypoint_candidates, None);
 
         assert_eq!(legs.len(), 3);
 

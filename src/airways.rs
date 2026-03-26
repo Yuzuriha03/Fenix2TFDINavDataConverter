@@ -14,6 +14,7 @@ use serde_json::{Map, Number, Value};
 
 use crate::db_json::write_json_objects;
 use crate::stats::{AirwayTimingBreakdown, PhaseDurations, TableExportStats};
+use crate::waypoints::WaypointIdIndex;
 
 const CHUNK_SIZE: usize = 2048;
 
@@ -259,6 +260,7 @@ pub(crate) fn export_airway_tables(
     rte_seg_path: &Path,
     preloaded_rte_seg: Option<&PreloadedRteSegData>,
     preloaded_waypoint_candidates: Option<&PreloadedWaypointCandidates>,
+    waypoint_id_index: Option<&WaypointIdIndex>,
 ) -> Result<(Vec<TableExportStats>, AirwayTimingBreakdown)> {
     let airway_db_read_time = Duration::default();
 
@@ -287,8 +289,11 @@ pub(crate) fn export_airway_tables(
     };
 
     let airway_transform_start = Instant::now();
-    let (formatted_airways, formatted_legs) =
-        rte_seg::build_airway_tables_from_rows(rte_seg_rows, waypoint_candidates);
+    let (formatted_airways, formatted_legs) = rte_seg::build_airway_tables_from_rows_with_id_index(
+        rte_seg_rows,
+        waypoint_candidates,
+        waypoint_id_index,
+    );
     let airway_transform_time = airway_transform_start.elapsed();
 
     let airway_leg_transform_start = Instant::now();

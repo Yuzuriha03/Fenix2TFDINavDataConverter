@@ -4,6 +4,7 @@ pub mod db_json;
 pub mod stats;
 pub mod tables;
 pub mod terminal_legs;
+pub mod waypoints;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -25,9 +26,16 @@ use config::{
     prompt_db3_path, prompt_rte_seg_path, validate_required_tables,
 };
 use db_json::configure_read_connection;
-use stats::ExportStats;
+use stats::{AirwayTimingBreakdown, ExportStats, TableExportStats, TerminalLegExportStats};
 use tables::{ExistingJsonIndex, export_table_to_json, preload_existing_table_indices};
 use terminal_legs::export_terminal_legs;
+use waypoints::{
+    AirportIdIndex, IlsIdIndex, NavaidIdIndex, RunwayIdIndex, WaypointIdIndex,
+    build_airport_id_index, build_ils_id_index, build_navaid_id_index, build_runway_id_index,
+    build_waypoint_id_index, export_airport_lookup_table, export_airports_table,
+    export_ilses_table, export_navaid_lookup_table, export_navaids_table, export_runways_table,
+    export_terminals_table, export_waypoint_lookup_table, export_waypoints_table,
+};
 
 const EXPORT_TABLES: &[&str] = &[
     "Waypoints",
@@ -97,6 +105,72 @@ struct ExportDb3ToJsonParams<'a> {
     preloaded_rte_seg: &'a PreloadedRteSegData,
     preloaded_waypoint_candidates: &'a PreloadedWaypointCandidates,
     preloaded_existing_indices: Option<PreloadedTableIndicesByName>,
+}
+
+struct ExportRuntimeContext<'a> {
+    db_path: &'a Path,
+    start_terminal_id: i64,
+    output_dir: &'a Path,
+    base_json_dir: Option<&'a Path>,
+    airway_reference: &'a airways::AirwayReferenceData,
+    rte_seg_path: &'a Path,
+    preloaded_rte_seg: &'a PreloadedRteSegData,
+    preloaded_waypoint_candidates: &'a PreloadedWaypointCandidates,
+}
+
+struct ReferenceIdIndices {
+    airport: AirportIdIndex,
+    runway: RunwayIdIndex,
+    ils: IlsIdIndex,
+    waypoint: WaypointIdIndex,
+    navaid: NavaidIdIndex,
+}
+
+struct RelatedExportResults {
+    table_stats: Vec<TableExportStats>,
+    table_export_wall: Duration,
+    airway_detail: AirwayTimingBreakdown,
+    terminal_leg_stats: TerminalLegExportStats,
+    terminal_leg_wall: Duration,
+}
+
+impl<'a> ExportDb3ToJsonParams<'a> {
+    fn split(self) -> (ExportRuntimeContext<'a>, PreloadedTableIndicesByName) {
+        let Self {
+            db_path,
+            start_terminal_id,
+            output_dir,
+            base_json_dir,
+            airway_reference,
+            rte_seg_path,
+            preloaded_rte_seg,
+            preloaded_waypoint_candidates,
+            preloaded_existing_indices,
+        } = self;
+        (
+            ExportRuntimeContext {
+                db_path,
+                start_terminal_id,
+                output_dir,
+                base_json_dir,
+                airway_reference,
+                rte_seg_path,
+                preloaded_rte_seg,
+                preloaded_waypoint_candidates,
+            },
+            preloaded_existing_indices.unwrap_or_default(),
+        )
+    }
+}
+
+impl ReferenceIdIndices {
+    const fn waypoint_count(&self) -> usize {
+        self.airport.db_row_count()
+            + self.runway.db_row_count()
+            + self.ils.db_row_count()
+            + self.waypoint.db_row_count()
+            + self.navaid.db_row_count()
+    }
 }
 
 fn main() {
@@ -599,63 +673,87 @@ fn execute_output_target(params: ExecuteOutputTargetParams<'_>) -> Result<Output
 }
 
 fn export_db3_to_json(params: ExportDb3ToJsonParams<'_>) -> Result<ExportStats> {
-    let ExportDb3ToJsonParams {
-        db_path,
-        start_terminal_id,
-        output_dir,
-        base_json_dir,
-        airway_reference,
-        rte_seg_path,
-        preloaded_rte_seg,
-        preloaded_waypoint_candidates,
-        preloaded_existing_indices,
-    } = params;
-
     let export_start = Instant::now();
-    let waypoint_read_time = Duration::default();
-    let waypoint_count = 0usize;
-    let mut preloaded_existing_indices = preloaded_existing_indices.unwrap_or_default();
-    let table_jobs = EXPORT_TABLES
+    let waypoint_index_start = Instant::now();
+    let (context, preloaded_existing_indices) = params.split();
+    let indices = build_reference_id_indices(context.db_path, context.base_json_dir)?;
+    let waypoint_read_time = waypoint_index_start.elapsed();
+    let waypoint_count = indices.waypoint_count();
+    let table_jobs = build_table_jobs(preloaded_existing_indices);
+    let export_results = export_related_outputs(&context, &indices, table_jobs)?;
+
+    Ok(ExportStats {
+        waypoint_count,
+        waypoint_index_wall: waypoint_read_time,
+        table_stats: export_results.table_stats,
+        table_export_wall: export_results.table_export_wall,
+        airway_detail: export_results.airway_detail,
+        terminal_leg_stats: export_results.terminal_leg_stats,
+        terminal_leg_wall: export_results.terminal_leg_wall,
+        total_elapsed: export_start.elapsed(),
+    })
+}
+
+fn build_reference_id_indices(
+    db_path: &Path,
+    base_json_dir: Option<&Path>,
+) -> Result<ReferenceIdIndices> {
+    let airport = build_airport_id_index(db_path, base_json_dir)?;
+    let runway = build_runway_id_index(db_path, base_json_dir, &airport)?;
+    let ils = build_ils_id_index(db_path, base_json_dir, &runway)?;
+    let waypoint = build_waypoint_id_index(db_path, base_json_dir)?;
+    let navaid = build_navaid_id_index(db_path, base_json_dir)?;
+
+    Ok(ReferenceIdIndices {
+        airport,
+        runway,
+        ils,
+        waypoint,
+        navaid,
+    })
+}
+
+fn build_table_jobs(
+    mut preloaded_existing_indices: PreloadedTableIndicesByName,
+) -> Vec<(&'static str, Option<ExistingJsonIndex>)> {
+    EXPORT_TABLES
         .iter()
         .map(|table_name| (*table_name, preloaded_existing_indices.remove(*table_name)))
-        .collect::<Vec<_>>();
+        .collect()
+}
 
+fn export_related_outputs(
+    context: &ExportRuntimeContext<'_>,
+    indices: &ReferenceIdIndices,
+    table_jobs: Vec<(&'static str, Option<ExistingJsonIndex>)>,
+) -> Result<RelatedExportResults> {
     let ((table_export_result, airway_export_result), terminal_legs_result) = rayon::join(
         || {
             rayon::join(
-                || {
-                    let table_export_start = Instant::now();
-                    table_jobs
-                        .into_par_iter()
-                        .map(|(table_name, preloaded_existing_index)| {
-                            export_table_to_json(
-                                db_path,
-                                output_dir,
-                                base_json_dir,
-                                table_name,
-                                None,
-                                preloaded_existing_index,
-                            )
-                        })
-                        .collect::<Result<Vec<_>>>()
-                        .map(|stats| (stats, table_export_start.elapsed()))
-                },
+                || export_table_batch(context, indices, table_jobs),
                 || {
                     export_airway_tables(
-                        db_path,
-                        output_dir,
-                        airway_reference,
-                        rte_seg_path,
-                        Some(preloaded_rte_seg),
-                        Some(preloaded_waypoint_candidates),
+                        context.db_path,
+                        context.output_dir,
+                        context.airway_reference,
+                        context.rte_seg_path,
+                        Some(context.preloaded_rte_seg),
+                        Some(context.preloaded_waypoint_candidates),
+                        Some(&indices.waypoint),
                     )
                 },
             )
         },
         || {
             let terminal_leg_start = Instant::now();
-            export_terminal_legs(db_path, start_terminal_id, output_dir)
-                .map(|stats| (stats, terminal_leg_start.elapsed()))
+            export_terminal_legs(
+                context.db_path,
+                context.start_terminal_id,
+                context.output_dir,
+                &indices.waypoint,
+                &indices.navaid,
+            )
+            .map(|stats| (stats, terminal_leg_start.elapsed()))
         },
     );
 
@@ -665,16 +763,113 @@ fn export_db3_to_json(params: ExportDb3ToJsonParams<'_>) -> Result<ExportStats> 
     let (terminal_leg_stats, terminal_leg_wall) = terminal_legs_result?;
     table_stats.sort_by(|left, right| left.table_name.cmp(&right.table_name));
 
-    Ok(ExportStats {
-        waypoint_count,
-        waypoint_index_wall: waypoint_read_time,
+    Ok(RelatedExportResults {
         table_stats,
         table_export_wall,
         airway_detail,
         terminal_leg_stats,
         terminal_leg_wall,
-        total_elapsed: export_start.elapsed(),
     })
+}
+
+fn export_table_batch(
+    context: &ExportRuntimeContext<'_>,
+    indices: &ReferenceIdIndices,
+    table_jobs: Vec<(&'static str, Option<ExistingJsonIndex>)>,
+) -> Result<(Vec<TableExportStats>, Duration)> {
+    let table_export_start = Instant::now();
+    table_jobs
+        .into_par_iter()
+        .map(|(table_name, preloaded_existing_index)| {
+            export_table_job(context, indices, table_name, preloaded_existing_index)
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|stats| (stats, table_export_start.elapsed()))
+}
+
+fn export_table_job(
+    context: &ExportRuntimeContext<'_>,
+    indices: &ReferenceIdIndices,
+    table_name: &'static str,
+    preloaded_existing_index: Option<ExistingJsonIndex>,
+) -> Result<TableExportStats> {
+    match table_name {
+        "Airports" => export_airports_table(
+            context.db_path,
+            context.output_dir,
+            context.base_json_dir,
+            &indices.airport,
+            preloaded_existing_index,
+        ),
+        "AirportLookup" => export_airport_lookup_table(
+            context.db_path,
+            context.output_dir,
+            context.base_json_dir,
+            &indices.airport,
+            preloaded_existing_index,
+        ),
+        "Runways" => export_runways_table(
+            context.db_path,
+            context.output_dir,
+            context.base_json_dir,
+            &indices.runway,
+            &indices.airport,
+            preloaded_existing_index,
+        ),
+        "Ilses" => export_ilses_table(
+            context.db_path,
+            context.output_dir,
+            context.base_json_dir,
+            &indices.ils,
+            &indices.runway,
+            preloaded_existing_index,
+        ),
+        "Waypoints" => export_waypoints_table(
+            context.db_path,
+            context.output_dir,
+            context.base_json_dir,
+            &indices.waypoint,
+            &indices.navaid,
+            preloaded_existing_index,
+        ),
+        "WaypointLookup" => export_waypoint_lookup_table(
+            context.db_path,
+            context.output_dir,
+            context.base_json_dir,
+            &indices.waypoint,
+            preloaded_existing_index,
+        ),
+        "Navaids" => export_navaids_table(
+            context.db_path,
+            context.output_dir,
+            context.base_json_dir,
+            &indices.navaid,
+            preloaded_existing_index,
+        ),
+        "NavaidLookup" => export_navaid_lookup_table(
+            context.db_path,
+            context.output_dir,
+            context.base_json_dir,
+            &indices.navaid,
+            preloaded_existing_index,
+        ),
+        "Terminals" => export_terminals_table(
+            context.db_path,
+            context.output_dir,
+            context.base_json_dir,
+            &indices.airport,
+            &indices.runway,
+            preloaded_existing_index,
+        ),
+        _ => export_table_to_json(
+            context.db_path,
+            context.output_dir,
+            context.base_json_dir,
+            table_name,
+            None,
+            preloaded_existing_index,
+        ),
+    }
 }
 
 fn format_duration(duration: Duration) -> String {

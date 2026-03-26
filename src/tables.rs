@@ -23,6 +23,18 @@ pub(crate) struct ExistingJsonIndex {
     pub(crate) row_count: usize,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct PreformattedJsonExport<'a> {
+    pub(crate) output_dir: &'a Path,
+    pub(crate) table_name: &'a str,
+    pub(crate) formatted_rows: &'a [Map<String, Value>],
+    pub(crate) existing_merge: Option<&'a ExistingJsonIndex>,
+    pub(crate) source_rows: usize,
+    pub(crate) existing_load_time: std::time::Duration,
+    pub(crate) db_read_time: std::time::Duration,
+    pub(crate) format_time: std::time::Duration,
+}
+
 pub(crate) fn export_table_to_json(
     db_path: &Path,
     output_dir: &Path,
@@ -69,37 +81,15 @@ pub(crate) fn export_table_to_json(
             .collect()
     };
     let format_time = format_start.elapsed();
-    let formatted_rows_count = formatted_rows.len();
-
-    let merge_start = Instant::now();
-    let merge_time = merge_start.elapsed();
-    let json_transform_time = existing_load_time + format_time + merge_time;
-
-    let output_path = output_dir.join(format!("{table_name}.json"));
-    let json_write_start = Instant::now();
-    let final_row_count = if let Some(existing) = &existing_merge {
-        write_json_append_from_base(&existing.path, &output_path, &formatted_rows)?;
-        existing.row_count + formatted_rows_count
-    } else {
-        write_json_objects(&output_path, &formatted_rows)?;
-        formatted_rows_count
-    };
-
-    Ok(TableExportStats {
-        table_name: table_name.to_string(),
-        row_count: final_row_count,
-        phase: PhaseDurations {
-            db_read: db_read_time,
-            json_transform: json_transform_time,
-            json_write: json_write_start.elapsed(),
-        },
-        detail: Some(TableTimingBreakdown {
-            source_rows,
-            formatted_rows: formatted_rows_count,
-            existing_load: existing_load_time,
-            format_rows: format_time,
-            merge_rows: merge_time,
-        }),
+    export_preformatted_rows_to_json(PreformattedJsonExport {
+        output_dir,
+        table_name,
+        formatted_rows: &formatted_rows,
+        existing_merge: existing_merge.as_ref(),
+        source_rows,
+        existing_load_time,
+        db_read_time,
+        format_time,
     })
 }
 
@@ -116,7 +106,7 @@ pub(crate) fn preload_existing_table_indices(
     Ok(indices)
 }
 
-fn load_existing_id_index(
+pub(crate) fn load_existing_id_index(
     base_json_dir: Option<&Path>,
     table_name: &str,
 ) -> Result<Option<ExistingJsonIndex>> {
@@ -142,6 +132,53 @@ fn load_existing_id_index(
         ids: existing_ids,
         row_count,
     }))
+}
+
+pub(crate) fn export_preformatted_rows_to_json(
+    params: PreformattedJsonExport<'_>,
+) -> Result<TableExportStats> {
+    let PreformattedJsonExport {
+        output_dir,
+        table_name,
+        formatted_rows,
+        existing_merge,
+        source_rows,
+        existing_load_time,
+        db_read_time,
+        format_time,
+    } = params;
+    let formatted_rows_count = formatted_rows.len();
+
+    let merge_start = Instant::now();
+    let merge_time = merge_start.elapsed();
+    let json_transform_time = existing_load_time + format_time + merge_time;
+
+    let output_path = output_dir.join(format!("{table_name}.json"));
+    let json_write_start = Instant::now();
+    let final_row_count = if let Some(existing) = existing_merge {
+        write_json_append_from_base(&existing.path, &output_path, formatted_rows)?;
+        existing.row_count + formatted_rows_count
+    } else {
+        write_json_objects(&output_path, formatted_rows)?;
+        formatted_rows_count
+    };
+
+    Ok(TableExportStats {
+        table_name: table_name.to_string(),
+        row_count: final_row_count,
+        phase: PhaseDurations {
+            db_read: db_read_time,
+            json_transform: json_transform_time,
+            json_write: json_write_start.elapsed(),
+        },
+        detail: Some(TableTimingBreakdown {
+            source_rows,
+            formatted_rows: formatted_rows_count,
+            existing_load: existing_load_time,
+            format_rows: format_time,
+            merge_rows: merge_time,
+        }),
+    })
 }
 
 fn scan_json_id_index(bytes: &[u8]) -> (HashSet<i64>, usize) {

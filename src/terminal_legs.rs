@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
-use rusqlite::{Connection, params, params_from_iter};
+use rusqlite::{Connection, params_from_iter};
 use serde::ser::{Serialize, SerializeStruct, Serializer};
 use serde_json::{Number, Value};
 
@@ -15,6 +15,7 @@ use crate::db_json::{
     write_json_objects_if_changed_with_buffer, write_json_objects_with_buffer,
 };
 use crate::stats::{PhaseDurations, TerminalLegExportStats, TerminalLegTimingBreakdown};
+use crate::waypoints::{NavaidIdIndex, ReferenceIdIndex, WaypointIdIndex};
 
 const PROCEDURE_LEG_JSON_BUFFER_CAPACITY: usize = 16 * 1024;
 
@@ -105,6 +106,7 @@ impl TerminalLegRecord {
         runway_ids_by_terminal: &HashMap<i64, i64>,
         runway_coords: &HashMap<i64, (f64, f64)>,
         waypoint_coords: &HashMap<i64, (f64, f64)>,
+        navaid_coords: &HashMap<i64, (f64, f64)>,
     ) {
         let missing_wpt = value_is_null(&self.wpt_id)
             && value_is_null(&self.wpt_lat)
@@ -141,7 +143,7 @@ impl TerminalLegRecord {
 
         if should_fill_value(&self.nav_id, &self.nav_lat, &self.nav_lon)
             && let Some(point_id) = self.nav_id_num
-            && let Some(coords) = waypoint_coords.get(&point_id)
+            && let Some(coords) = navaid_coords.get(&point_id)
         {
             self.nav_lat = rounded_number_value(coords.0);
             self.nav_lon = rounded_number_value(coords.1);
@@ -150,6 +152,20 @@ impl TerminalLegRecord {
 
     const fn vnav(&self) -> Option<f64> {
         self.vnav_num
+    }
+
+    fn remap_reference_ids(
+        &mut self,
+        waypoint_id_index: &WaypointIdIndex,
+        navaid_id_index: &NavaidIdIndex,
+    ) {
+        remap_leg_id_value(&mut self.wpt_id, &mut self.wpt_id_num, waypoint_id_index);
+        remap_leg_id_value(&mut self.nav_id, &mut self.nav_id_num, navaid_id_index);
+        remap_leg_id_value(
+            &mut self.center_id,
+            &mut self.center_id_num,
+            waypoint_id_index,
+        );
     }
 }
 
@@ -255,6 +271,8 @@ pub(crate) fn export_terminal_legs(
     db_path: &Path,
     start_terminal_id: i64,
     output_dir: &Path,
+    waypoint_id_index: &WaypointIdIndex,
+    navaid_id_index: &NavaidIdIndex,
 ) -> Result<TerminalLegExportStats> {
     let cleanup_required = procedure_dir_has_existing_files_from(output_dir, start_terminal_id)?;
     let files_may_already_exist = cleanup_required;
@@ -265,6 +283,7 @@ pub(crate) fn export_terminal_legs(
         terminal_ids_for_cleanup,
         runway_coords,
         waypoint_coords,
+        navaid_coords,
         mut detail,
     ) = with_connection(db_path, |conn| {
         let t_terminal_legs = Instant::now();
@@ -283,14 +302,19 @@ pub(crate) fn export_terminal_legs(
 
         let runway_ids: HashSet<i64> = runway_ids_by_terminal.values().copied().collect();
         let waypoint_ids = collect_waypoint_reference_ids(&terminal_legs);
+        let navaid_ids = collect_navaid_reference_ids(&terminal_legs);
 
         let t_runway_coords = Instant::now();
         let runway_coords = fetch_runway_coordinates_by_ids(conn, &runway_ids)?;
         let db_runway_coords = t_runway_coords.elapsed();
 
         let t_waypoint_coords = Instant::now();
-        let waypoint_coords = fetch_waypoint_coordinates_by_ids(conn, &waypoint_ids)?;
+        let waypoint_coords =
+            fetch_waypoint_coordinates_by_db_ids(conn, &waypoint_ids, waypoint_id_index)?;
+        let navaid_coords = fetch_navaid_coordinates_by_db_ids(conn, &navaid_ids, navaid_id_index)?;
         let db_waypoint_coords = t_waypoint_coords.elapsed();
+        let mut terminal_legs = terminal_legs;
+        remap_terminal_leg_reference_ids(&mut terminal_legs, waypoint_id_index, navaid_id_index);
 
         Ok::<_, anyhow::Error>((
             terminal_legs,
@@ -298,6 +322,7 @@ pub(crate) fn export_terminal_legs(
             terminal_ids_for_cleanup,
             runway_coords,
             waypoint_coords,
+            navaid_coords,
             TerminalLegTimingBreakdown {
                 db_terminal_legs,
                 db_terminal_metadata,
@@ -320,6 +345,7 @@ pub(crate) fn export_terminal_legs(
         &runway_ids_by_terminal,
         &runway_coords,
         &waypoint_coords,
+        &navaid_coords,
     )
     .par_bridge()
     .try_for_each(|(terminal_id, mut legs)| {
@@ -375,7 +401,7 @@ fn fetch_terminal_legs(
         )
         .context("failed to query TerminalLegs")?;
     let rows = statement
-        .query_map(params![start_terminal_id], TerminalLegRecord::from_row)
+        .query_map([start_terminal_id], TerminalLegRecord::from_row)
         .context("failed to iterate TerminalLegs")?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .context("failed to read TerminalLegs")
@@ -389,7 +415,7 @@ fn fetch_runway_ids_by_terminal_after_start(
         .prepare("SELECT ID, RwyID FROM Terminals WHERE ID >= ? AND RwyID IS NOT NULL")
         .context("failed to query terminal runway ids")?;
     let rows = statement
-        .query_map(params![start_terminal_id], |row| {
+        .query_map([start_terminal_id], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
         })
         .context("failed to iterate terminal runway ids")?;
@@ -418,6 +444,7 @@ struct TerminalJobIter<'a> {
     runway_ids_by_terminal: &'a HashMap<i64, i64>,
     runway_coords: &'a HashMap<i64, (f64, f64)>,
     waypoint_coords: &'a HashMap<i64, (f64, f64)>,
+    navaid_coords: &'a HashMap<i64, (f64, f64)>,
 }
 
 impl<'a> TerminalJobIter<'a> {
@@ -426,6 +453,7 @@ impl<'a> TerminalJobIter<'a> {
         runway_ids_by_terminal: &'a HashMap<i64, i64>,
         runway_coords: &'a HashMap<i64, (f64, f64)>,
         waypoint_coords: &'a HashMap<i64, (f64, f64)>,
+        navaid_coords: &'a HashMap<i64, (f64, f64)>,
     ) -> Self {
         Self {
             legs: legs.into_iter(),
@@ -433,6 +461,7 @@ impl<'a> TerminalJobIter<'a> {
             runway_ids_by_terminal,
             runway_coords,
             waypoint_coords,
+            navaid_coords,
         }
     }
 }
@@ -446,6 +475,7 @@ impl Iterator for TerminalJobIter<'_> {
             self.runway_ids_by_terminal,
             self.runway_coords,
             self.waypoint_coords,
+            self.navaid_coords,
         );
         let terminal_id = first.terminal_id;
         let mut group = vec![first];
@@ -459,6 +489,7 @@ impl Iterator for TerminalJobIter<'_> {
                 self.runway_ids_by_terminal,
                 self.runway_coords,
                 self.waypoint_coords,
+                self.navaid_coords,
             );
             group.push(leg);
         }
@@ -563,6 +594,13 @@ fn collect_waypoint_reference_ids(terminal_legs: &[TerminalLegRecord]) -> HashSe
         if let Some(id) = leg.center_id_num {
             ids.insert(id);
         }
+    }
+    ids
+}
+
+fn collect_navaid_reference_ids(terminal_legs: &[TerminalLegRecord]) -> HashSet<i64> {
+    let mut ids = HashSet::new();
+    for leg in terminal_legs {
         if let Some(id) = leg.nav_id_num {
             ids.insert(id);
         }
@@ -570,11 +608,24 @@ fn collect_waypoint_reference_ids(terminal_legs: &[TerminalLegRecord]) -> HashSe
     ids
 }
 
-fn fetch_waypoint_coordinates_by_ids(
+fn fetch_waypoint_coordinates_by_db_ids(
     conn: &Connection,
-    ids: &HashSet<i64>,
+    db_ids: &HashSet<i64>,
+    waypoint_id_index: &WaypointIdIndex,
 ) -> Result<HashMap<i64, (f64, f64)>> {
-    fetch_coordinates_by_ids(conn, "Waypoints", ids)
+    fetch_output_coordinates_by_db_ids(conn, "Waypoints", db_ids, |db_id| {
+        waypoint_id_index.output_id_for_db(db_id)
+    })
+}
+
+fn fetch_navaid_coordinates_by_db_ids(
+    conn: &Connection,
+    db_ids: &HashSet<i64>,
+    navaid_id_index: &NavaidIdIndex,
+) -> Result<HashMap<i64, (f64, f64)>> {
+    fetch_output_coordinates_by_db_ids(conn, "Navaids", db_ids, |db_id| {
+        navaid_id_index.output_id_for_db(db_id)
+    })
 }
 
 fn fetch_runway_coordinates_by_ids(
@@ -629,6 +680,44 @@ fn fetch_coordinates_by_ids(
     }
 
     Ok(map)
+}
+
+fn fetch_output_coordinates_by_db_ids(
+    conn: &Connection,
+    table_name: &str,
+    db_ids: &HashSet<i64>,
+    map_id: impl Fn(i64) -> i64,
+) -> Result<HashMap<i64, (f64, f64)>> {
+    let raw_coords = fetch_coordinates_by_ids(conn, table_name, db_ids)?;
+    let mut remapped = HashMap::with_capacity(raw_coords.len());
+    for (db_id, coords) in raw_coords {
+        remapped.entry(map_id(db_id)).or_insert(coords);
+    }
+    Ok(remapped)
+}
+
+fn remap_terminal_leg_reference_ids(
+    terminal_legs: &mut [TerminalLegRecord],
+    waypoint_id_index: &WaypointIdIndex,
+    navaid_id_index: &NavaidIdIndex,
+) {
+    for leg in terminal_legs {
+        leg.remap_reference_ids(waypoint_id_index, navaid_id_index);
+    }
+}
+
+fn remap_leg_id_value(value: &mut Value, numeric: &mut Option<i64>, id_index: &ReferenceIdIndex) {
+    let Some(db_id) = *numeric else {
+        return;
+    };
+
+    let output_id = id_index.output_id_for_db(db_id);
+    if output_id == db_id {
+        return;
+    }
+
+    *numeric = Some(output_id);
+    *value = Value::Number(Number::from(output_id));
 }
 
 fn resolve_longitude_column(conn: &Connection, table_name: &str) -> Result<&'static str> {
