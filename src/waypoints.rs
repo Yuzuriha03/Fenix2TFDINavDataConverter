@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde_json::{Map, Number, Value};
 
 use crate::db_json::{
@@ -51,7 +51,7 @@ struct ForeignKeyRemap<'a> {
 }
 
 fn fast_hash_map_with_capacity<K, V>(capacity: usize) -> FxHashMap<K, V> {
-    FxHashMap::with_capacity_and_hasher(capacity, Default::default())
+    FxHashMap::with_capacity_and_hasher(capacity, FxBuildHasher)
 }
 
 fn fast_hash_set<T>() -> FxHashSet<T> {
@@ -543,7 +543,7 @@ fn build_reference_id_index_from_rows(
     let mut existing_id_by_key = fast_hash_map_with_capacity(existing_rows.len());
     let mut used_ids: FxHashSet<i64> = FxHashSet::with_capacity_and_hasher(
         existing_rows.len() + db_rows.len(),
-        Default::default(),
+        FxBuildHasher,
     );
 
     for row in existing_rows {

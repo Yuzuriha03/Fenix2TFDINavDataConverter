@@ -6,7 +6,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use rusqlite::{Connection, params_from_iter};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde::Deserialize;
 use serde::ser::{Serialize, SerializeStruct, Serializer};
 use serde_json::{Number, Value};
@@ -28,7 +28,7 @@ fn fast_hash_map<K, V>() -> FxHashMap<K, V> {
 }
 
 fn fast_hash_map_with_capacity<K, V>(capacity: usize) -> FxHashMap<K, V> {
-    FxHashMap::with_capacity_and_hasher(capacity, Default::default())
+    FxHashMap::with_capacity_and_hasher(capacity, FxBuildHasher)
 }
 
 fn fast_hash_set<T>() -> FxHashSet<T> {
@@ -564,12 +564,12 @@ fn group_terminal_legs_by_terminal(
     let mut current_terminal_id = first.terminal_id;
     let mut current_group = vec![first];
     for leg in legs {
-        if leg.terminal_id != current_terminal_id {
+        if leg.terminal_id == current_terminal_id {
+            current_group.push(leg);
+        } else {
             groups.push((current_terminal_id, current_group));
             current_terminal_id = leg.terminal_id;
             current_group = vec![leg];
-        } else {
-            current_group.push(leg);
         }
     }
     groups.push((current_terminal_id, current_group));
@@ -908,7 +908,7 @@ mod tests {
         fs::write(&remove_path, "[]").expect("write stale file");
         fs::write(&ignored_path, "[]").expect("write ignored file");
 
-        let allowed: FxHashSet<i64> = [100_i64].into_iter().collect();
+        let allowed: FxHashSet<i64> = std::iter::once(100_i64).collect();
         let removed = cleanup_extra_procedure_files(&output_dir, &allowed).expect("cleanup files");
 
         assert_eq!(removed, 1);

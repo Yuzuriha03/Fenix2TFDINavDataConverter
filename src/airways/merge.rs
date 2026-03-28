@@ -1,5 +1,5 @@
 use rayon::prelude::*;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::{FxBuildHasher as BuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
 
 use super::{
     AirwayLegOutputRow, AirwayLegReferenceRow, AirwayOutputRow, AirwayReferenceData,
@@ -13,16 +13,16 @@ type SourceLegRowsByIdent<'a> = HashMap<String, Vec<&'a AirwayLegOutputRow>>;
 type ReferenceAirwayRowsByIdent<'a> = HashMap<String, &'a AirwayReferenceRow>;
 type ReferenceLegRowsByIdent<'a> = HashMap<String, Vec<&'a AirwayLegReferenceRow>>;
 
-fn fast_hash_map<K, V>() -> HashMap<K, V> {
-    HashMap::with_hasher(Default::default())
+const fn fast_hash_map<K, V>() -> HashMap<K, V> {
+    HashMap::with_hasher(BuildHasher)
 }
 
 fn fast_hash_map_with_capacity<K, V>(capacity: usize) -> HashMap<K, V> {
-    HashMap::with_capacity_and_hasher(capacity, Default::default())
+    HashMap::with_capacity_and_hasher(capacity, BuildHasher)
 }
 
 fn fast_hash_set_with_capacity<T>(capacity: usize) -> HashSet<T> {
-    HashSet::with_capacity_and_hasher(capacity, Default::default())
+    HashSet::with_capacity_and_hasher(capacity, BuildHasher)
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -58,12 +58,13 @@ struct InsertPath<'a> {
     to_idx: usize,
 }
 
+
 impl InsertPath<'_> {
-    fn point_count(&self) -> usize {
+    const fn point_count(&self) -> usize {
         self.from_idx.abs_diff(self.to_idx) + 1
     }
 
-    fn segment_count(&self) -> usize {
+    const fn segment_count(&self) -> usize {
         self.point_count().saturating_sub(1)
     }
 
@@ -829,7 +830,7 @@ fn undirected_pair(left: &str, right: &str) -> (String, String) {
     }
 }
 
-fn swap_leg_direction(row: &mut AirwayLegOutputRow) {
+const fn swap_leg_direction(row: &mut AirwayLegOutputRow) {
     std::mem::swap(&mut row.waypoint1_id, &mut row.waypoint2_id);
     std::mem::swap(&mut row.waypoint1, &mut row.waypoint2);
     std::mem::swap(&mut row.is_start, &mut row.is_end);
@@ -874,7 +875,7 @@ fn flush_chain(chains: &mut Vec<Chain>, current_points: &mut Vec<String>) {
     }
 }
 
-fn leg_flag(value: i64) -> bool {
+const fn leg_flag(value: i64) -> bool {
     value == 1
 }
 
@@ -889,6 +890,17 @@ fn one_based_i64(index: usize) -> i64 {
 mod tests {
     use super::*;
 
+    struct LegParams {
+        id: i64,
+        airway_id: i64,
+        waypoint1_id: i64,
+        waypoint2_id: i64,
+        is_start: bool,
+        is_end: bool,
+        waypoint1: String,
+        waypoint2: String,
+    }
+
     fn airway_row(id: i64, ident: &str) -> AirwayOutputRow {
         AirwayOutputRow {
             id,
@@ -896,26 +908,17 @@ mod tests {
         }
     }
 
-    fn source_leg_row(
-        id: i64,
-        airway_id: i64,
-        waypoint1_id: i64,
-        waypoint2_id: i64,
-        is_start: bool,
-        is_end: bool,
-        waypoint1: &str,
-        waypoint2: &str,
-    ) -> AirwayLegOutputRow {
+    fn source_leg_row(params: LegParams) -> AirwayLegOutputRow {
         AirwayLegOutputRow {
-            id,
-            airway_id,
+            id: params.id,
+            airway_id: params.airway_id,
             level: "B".to_string(),
-            waypoint1_id: Some(waypoint1_id),
-            waypoint2_id: Some(waypoint2_id),
-            is_start: i64::from(is_start),
-            is_end: i64::from(is_end),
-            waypoint1: waypoint1.to_string(),
-            waypoint2: waypoint2.to_string(),
+            waypoint1_id: Some(params.waypoint1_id),
+            waypoint2_id: Some(params.waypoint2_id),
+            is_start: i64::from(params.is_start),
+            is_end: i64::from(params.is_end),
+            waypoint1: params.waypoint1,
+            waypoint2: params.waypoint2,
         }
     }
 
@@ -926,26 +929,17 @@ mod tests {
         }
     }
 
-    fn reference_leg_row(
-        id: i64,
-        airway_id: i64,
-        waypoint1_id: i64,
-        waypoint2_id: i64,
-        is_start: i64,
-        is_end: i64,
-        waypoint1: &str,
-        waypoint2: &str,
-    ) -> AirwayLegReferenceRow {
+    fn reference_leg_row(params: LegParams) -> AirwayLegReferenceRow {
         AirwayLegReferenceRow {
-            id,
-            airway_id,
+            id: params.id,
+            airway_id: params.airway_id,
             level: "B".to_string(),
-            waypoint1: waypoint1.to_string(),
-            waypoint2: waypoint2.to_string(),
-            waypoint1_id,
-            waypoint2_id,
-            is_start,
-            is_end,
+            waypoint1: params.waypoint1,
+            waypoint2: params.waypoint2,
+            waypoint1_id: params.waypoint1_id,
+            waypoint2_id: params.waypoint2_id,
+            is_start: i64::from(params.is_start),
+            is_end: i64::from(params.is_end),
         }
     }
 
@@ -953,12 +947,39 @@ mod tests {
     fn merge_inserts_missing_segments_and_keeps_global_ids_sequential() {
         let source_airways = vec![airway_row(42, "H100")];
         let source_legs = vec![
-            source_leg_row(1, 42, 101, 102, true, false, "A", "B"),
-            source_leg_row(2, 42, 102, 103, false, true, "B", "C"),
+            source_leg_row(LegParams {
+                id: 1,
+                airway_id: 42,
+                waypoint1_id: 101,
+                waypoint2_id: 102,
+                is_start: true,
+                is_end: false,
+                waypoint1: "A".to_string(),
+                waypoint2: "B".to_string(),
+            }),
+            source_leg_row(LegParams {
+                id: 2,
+                airway_id: 42,
+                waypoint1_id: 102,
+                waypoint2_id: 103,
+                is_start: false,
+                is_end: true,
+                waypoint1: "B".to_string(),
+                waypoint2: "C".to_string(),
+            }),
         ];
         let airway_reference = AirwayReferenceData {
             airways: vec![reference_airway_row(7, "H100")],
-            airway_legs: vec![reference_leg_row(10, 7, 101, 103, 1, 1, "A", "C")],
+            airway_legs: vec![reference_leg_row(LegParams {
+                id: 10,
+                airway_id: 7,
+                waypoint1_id: 101,
+                waypoint2_id: 103,
+                is_start: true,
+                is_end: true,
+                waypoint1: "A".to_string(),
+                waypoint2: "C".to_string(),
+            })],
             mirror_reference: super::super::AirwayMirrorReference::default(),
         };
 
@@ -987,8 +1008,26 @@ mod tests {
         let airway_reference = AirwayReferenceData {
             airways: vec![reference_airway_row(2, "Z1"), reference_airway_row(1, "A1")],
             airway_legs: vec![
-                reference_leg_row(20, 1, 102, 103, 0, 1, "B", "C"),
-                reference_leg_row(10, 1, 101, 102, 1, 0, "A", "B"),
+                reference_leg_row(LegParams {
+                    id: 20,
+                    airway_id: 1,
+                    waypoint1_id: 102,
+                    waypoint2_id: 103,
+                    is_start: false,
+                    is_end: true,
+                    waypoint1: "B".to_string(),
+                    waypoint2: "C".to_string(),
+                }),
+                reference_leg_row(LegParams {
+                    id: 10,
+                    airway_id: 1,
+                    waypoint1_id: 101,
+                    waypoint2_id: 102,
+                    is_start: true,
+                    is_end: false,
+                    waypoint1: "A".to_string(),
+                    waypoint2: "B".to_string(),
+                }),
             ],
             mirror_reference: super::super::AirwayMirrorReference::default(),
         };

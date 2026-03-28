@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{Result, anyhow, bail};
 use rusqlite::Connection;
 use rusqlite::params_from_iter;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::{FxBuildHasher as BuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::db_json::{
     configure_read_connection, extract_csv_fields_simple, read_text_gbk, trim_csv_field,
@@ -18,16 +18,16 @@ use super::{
 type AirwayBuildOutput = (Vec<AirwayOutputRow>, Vec<AirwayLegOutputRow>);
 type AirwayNodeKey = i64;
 
-fn fast_hash_map<K, V>() -> HashMap<K, V> {
-    HashMap::with_hasher(Default::default())
+const fn fast_hash_map<K, V>() -> HashMap<K, V> {
+    HashMap::with_hasher(BuildHasher)
 }
 
 fn fast_hash_map_with_capacity<K, V>(capacity: usize) -> HashMap<K, V> {
-    HashMap::with_capacity_and_hasher(capacity, Default::default())
+    HashMap::with_capacity_and_hasher(capacity, BuildHasher)
 }
 
-fn fast_hash_set<T>() -> HashSet<T> {
-    HashSet::with_hasher(Default::default())
+const fn fast_hash_set<T>() -> HashSet<T> {
+    HashSet::with_hasher(BuildHasher)
 }
 
 #[derive(Clone, Debug)]
@@ -318,7 +318,7 @@ fn split_rte_seg_segments_into_chains(
         let end_node = segment_end_node(segment);
 
         outgoing_by_node
-            .entry(start_node.clone())
+            .entry(start_node)
             .or_default()
             .push(index);
         *outgoing_count_by_node.entry(start_node).or_default() += 1;
@@ -445,11 +445,11 @@ fn build_airway_segment_chain(
     chain
 }
 
-fn segment_start_node(segment: &DirectedAirwaySegment) -> AirwayNodeKey {
+const fn segment_start_node(segment: &DirectedAirwaySegment) -> AirwayNodeKey {
     segment.start_id
 }
 
-fn segment_end_node(segment: &DirectedAirwaySegment) -> AirwayNodeKey {
+const fn segment_end_node(segment: &DirectedAirwaySegment) -> AirwayNodeKey {
     segment.end_id
 }
 
