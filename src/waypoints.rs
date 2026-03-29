@@ -9,7 +9,8 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde_json::{Map, Number, Value};
 
 use crate::db_json::{
-    configure_read_connection, fetch_table_rows, format_row, json_to_i64, write_json_objects,
+    configure_read_connection, fetch_table_rows, format_row, json_to_i64,
+    normalize_row_numbers_for_table, write_json_objects,
 };
 use crate::stats::TableExportStats;
 use crate::tables::{
@@ -205,18 +206,72 @@ pub(crate) fn export_ilses_table(
     runway_id_index: &RunwayIdIndex,
     preloaded_existing_index: Option<ExistingJsonIndex>,
 ) -> Result<TableExportStats> {
-    export_reference_table(
-        db_path,
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("failed to open database: {}", db_path.display()))?;
+    configure_read_connection(&conn);
+
+    let existing_load_start = Instant::now();
+    let existing_merge = match preloaded_existing_index {
+        Some(existing) => Some(existing),
+        None => load_existing_id_index(base_json_dir, "Ilses")?,
+    };
+    let existing_runway_ids = load_existing_id_index(base_json_dir, "Runways")?
+        .map_or_else(fast_hash_set, |existing| existing.ids);
+    let existing_load_time = existing_load_start.elapsed();
+
+    let db_read_start = Instant::now();
+    let rows = fetch_table_rows(&conn, "Ilses")?;
+    let db_read_time = db_read_start.elapsed();
+    let source_rows = rows.len();
+
+    let format_start = Instant::now();
+    let mut seen_output_ids: FxHashSet<i64> = existing_merge
+        .as_ref()
+        .map_or_else(fast_hash_set, |existing| {
+            existing.ids.iter().copied().collect()
+        });
+    let formatted_rows = rows
+        .into_iter()
+        .filter_map(|mut row| {
+            let output_runway_id =
+                ils_output_runway_id_for_export(&row, runway_id_index, &existing_runway_ids)?;
+
+            let db_id = json_to_i64(row.get("ID"))?;
+            let output_id = ils_id_index.output_id_for_db(db_id);
+            if !seen_output_ids.insert(output_id) {
+                return None;
+            }
+
+            row.insert("ID".to_string(), Value::Number(Number::from(output_id)));
+            row.insert(
+                "RunwayID".to_string(),
+                Value::Number(Number::from(output_runway_id)),
+            );
+            Some(format_row(row, "Ilses", None))
+        })
+        .collect::<Vec<_>>();
+    let format_time = format_start.elapsed();
+
+    export_preformatted_rows_to_json(PreformattedJsonExport {
         output_dir,
-        base_json_dir,
-        "Ilses",
-        ils_id_index,
-        &[ForeignKeyRemap {
-            column_name: "RunwayID",
-            index: runway_id_index,
-        }],
-        preloaded_existing_index,
-    )
+        table_name: "Ilses",
+        formatted_rows: &formatted_rows,
+        existing_merge: existing_merge.as_ref(),
+        source_rows,
+        existing_load_time,
+        db_read_time,
+        format_time,
+    })
+}
+
+fn ils_output_runway_id_for_export(
+    row: &Map<String, Value>,
+    runway_id_index: &RunwayIdIndex,
+    existing_runway_ids: &FxHashSet<i64>,
+) -> Option<i64> {
+    let db_runway_id = json_to_i64(row.get("RunwayID"))?;
+    let output_runway_id = runway_id_index.output_id_for_db(db_runway_id);
+    (!existing_runway_ids.contains(&output_runway_id)).then_some(output_runway_id)
 }
 
 pub(crate) fn export_navaids_table(
@@ -362,6 +417,10 @@ fn build_filtered_terminal_rows(
 ) -> Vec<Map<String, Value>> {
     let mut kept_existing_rows = existing_rows
         .into_iter()
+        .map(|mut row| {
+            normalize_row_numbers_for_table(&mut row, "Terminals");
+            row
+        })
         .filter(|row| !is_excluded_terminal_row(row))
         .collect::<Vec<_>>();
     let existing_ids = kept_existing_rows
@@ -399,7 +458,10 @@ fn build_reference_id_index(
     configure_read_connection(&conn);
 
     let db_rows = fetch_reference_rows(&conn, table_name, None, foreign_key_remaps)?;
-    let existing_rows = load_existing_json_rows(base_json_dir, json_file_name)?;
+    let mut existing_rows = load_existing_json_rows(base_json_dir, json_file_name)?;
+    for row in &mut existing_rows {
+        normalize_row_numbers_for_table(row, table_name);
+    }
 
     Ok(build_reference_id_index_from_rows(
         &db_rows,
@@ -541,10 +603,8 @@ fn build_reference_id_index_from_rows(
     key_columns: &[&str],
 ) -> ReferenceIdIndex {
     let mut existing_id_by_key = fast_hash_map_with_capacity(existing_rows.len());
-    let mut used_ids: FxHashSet<i64> = FxHashSet::with_capacity_and_hasher(
-        existing_rows.len() + db_rows.len(),
-        FxBuildHasher,
-    );
+    let mut used_ids: FxHashSet<i64> =
+        FxHashSet::with_capacity_and_hasher(existing_rows.len() + db_rows.len(), FxBuildHasher);
 
     for row in existing_rows {
         let Some(existing_id) = json_to_i64(row.get("ID")) else {
@@ -569,9 +629,10 @@ fn build_reference_id_index_from_rows(
         let Some(db_id) = json_to_i64(row.get("ID")) else {
             continue;
         };
+        let row_key = build_row_key(row, key_columns);
 
-        let output_id = if let Some(key) = build_row_key(row, key_columns) {
-            existing_id_by_key.get(&key).map_or_else(
+        let output_id = if let Some(key) = row_key.as_ref() {
+            existing_id_by_key.get(key).map_or_else(
                 || {
                     if used_ids.contains(&db_id) {
                         next_unused_id(&mut next_generated_id, &used_ids)
@@ -588,6 +649,9 @@ fn build_reference_id_index_from_rows(
         };
 
         used_ids.insert(output_id);
+        if let Some(key) = row_key {
+            existing_id_by_key.entry(key).or_insert(output_id);
+        }
         output_id_by_db_id.insert(db_id, output_id);
     }
 
@@ -727,5 +791,71 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(ids, vec![6, 10, 11, 12]);
+    }
+
+    fn ils_row(id: i64, runway_id: i64, ident: &str, loc_course: f64) -> Map<String, Value> {
+        let mut row = Map::new();
+        row.insert("ID".to_string(), Value::Number(Number::from(id)));
+        row.insert(
+            "RunwayID".to_string(),
+            Value::Number(Number::from(runway_id)),
+        );
+        row.insert("Ident".to_string(), Value::String(ident.to_string()));
+        row.insert(
+            "LocCourse".to_string(),
+            Value::Number(Number::from_f64(loc_course).unwrap()),
+        );
+        row
+    }
+
+    #[test]
+    fn reuses_output_id_for_duplicate_ils_rows_in_same_batch() {
+        let db_rows = vec![
+            ils_row(10, 500, "IABC", 95.0),
+            ils_row(20, 500, "IABC", 95.0),
+        ];
+
+        let index =
+            build_reference_id_index_from_rows(&db_rows, &[], &["RunwayID", "Ident", "LocCourse"]);
+
+        assert_eq!(index.output_id_for_db(10), 10);
+        assert_eq!(index.output_id_for_db(20), 10);
+    }
+
+    #[test]
+    fn skips_ils_rows_for_existing_output_runways() {
+        let mut existing_runway_ids = fast_hash_set();
+        existing_runway_ids.insert(900);
+
+        let mut row = Map::new();
+        row.insert("ID".to_string(), Value::Number(Number::from(77)));
+        row.insert("RunwayID".to_string(), Value::Number(Number::from(500)));
+        row.insert("Ident".to_string(), Value::String("IABC".to_string()));
+
+        let mut runway_index = ReferenceIdIndex::default();
+        runway_index.output_id_by_db_id.insert(500, 900);
+
+        assert_eq!(
+            ils_output_runway_id_for_export(&row, &runway_index, &existing_runway_ids),
+            None
+        );
+    }
+
+    #[test]
+    fn keeps_ils_rows_for_new_output_runways() {
+        let existing_runway_ids = fast_hash_set();
+
+        let mut row = Map::new();
+        row.insert("ID".to_string(), Value::Number(Number::from(77)));
+        row.insert("RunwayID".to_string(), Value::Number(Number::from(500)));
+        row.insert("Ident".to_string(), Value::String("IABC".to_string()));
+
+        let mut runway_index = ReferenceIdIndex::default();
+        runway_index.output_id_by_db_id.insert(500, 901);
+
+        assert_eq!(
+            ils_output_runway_id_for_export(&row, &runway_index, &existing_runway_ids),
+            Some(901)
+        );
     }
 }

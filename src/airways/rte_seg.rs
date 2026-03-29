@@ -317,10 +317,7 @@ fn split_rte_seg_segments_into_chains(
         let start_node = segment_start_node(segment);
         let end_node = segment_end_node(segment);
 
-        outgoing_by_node
-            .entry(start_node)
-            .or_default()
-            .push(index);
+        outgoing_by_node.entry(start_node).or_default().push(index);
         *outgoing_count_by_node.entry(start_node).or_default() += 1;
         *incoming_count_by_node.entry(end_node).or_default() += 1;
     }

@@ -146,12 +146,7 @@ pub(crate) fn format_row(
     table_name: &str,
     waypoints: Option<&HashMap<i64, String>>,
 ) -> Map<String, Value> {
-    if let Some(value) = row.remove("Longtitude") {
-        row.insert("Longitude".to_string(), round_json_number(&value));
-    }
-    if let Some(value) = row.get_mut("Latitude") {
-        *value = round_json_number(value);
-    }
+    normalize_row_numbers_for_table(&mut row, table_name);
 
     match table_name {
         "Ilses" => select_columns(
@@ -228,6 +223,25 @@ pub(crate) fn format_row(
             row
         }
         _ => row,
+    }
+}
+
+pub(crate) fn normalize_row_numbers_for_table(row: &mut Map<String, Value>, table_name: &str) {
+    if let Some(value) = row.remove("Longtitude") {
+        row.insert("Longitude".to_string(), round_numberish_json(&value));
+    }
+    let column_names = row.keys().cloned().collect::<Vec<_>>();
+    for column_name in column_names {
+        if !should_normalize_numberish_column(table_name, &column_name) {
+            continue;
+        }
+        if let Some(value) = row.get_mut(&column_name) {
+            *value = if should_round_numberish_column(&column_name) {
+                round_numberish_json(value)
+            } else {
+                normalize_numberish_json(value)
+            };
+        }
     }
 }
 
@@ -322,6 +336,90 @@ fn select_columns(mut row: Map<String, Value>, ordered_columns: &[&str]) -> Map<
     ordered
 }
 
+fn should_normalize_numberish_column(_table_name: &str, column_name: &str) -> bool {
+    column_name == "ID"
+        || column_name.ends_with("ID")
+        || column_name.ends_with("Lat")
+        || column_name.ends_with("Lon")
+        || matches!(
+            column_name,
+            "Altitude"
+                | "Bearing"
+                | "Category"
+                | "Collocated"
+                | "Course"
+                | "CrossingHeight"
+                | "Distance"
+                | "Elevation"
+                | "Freq"
+                | "GsAngle"
+                | "HasDme"
+                | "IsEnd"
+                | "IsStart"
+                | "Latitude"
+                | "Level"
+                | "Length"
+                | "LocCourse"
+                | "Longitude"
+                | "Longtitude"
+                | "MagneticVariation"
+                | "NavBear"
+                | "NavDist"
+                | "NavKeyCode"
+                | "PrimaryID"
+                | "Proc"
+                | "Range"
+                | "Surface"
+                | "TerminalID"
+                | "TransAlt"
+                | "TrueHeading"
+                | "Type"
+                | "Width"
+        )
+}
+
+fn should_round_numberish_column(column_name: &str) -> bool {
+    matches!(column_name, "Latitude" | "Longitude" | "Longtitude")
+        || column_name.ends_with("Lat")
+        || column_name.ends_with("Lon")
+}
+
+pub(crate) fn normalize_numberish_json(value: &Value) -> Value {
+    match value {
+        Value::Number(number) => {
+            normalize_json_number(number).map_or_else(|| value.clone(), Value::Number)
+        }
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return value.clone();
+            }
+
+            trimmed
+                .parse::<i64>()
+                .map(Number::from)
+                .or_else(|_| trimmed.parse::<u64>().map(Number::from))
+                .or_else(|_| {
+                    trimmed
+                        .parse::<f64>()
+                        .ok()
+                        .and_then(number_from_f64_canonical)
+                        .ok_or(())
+                })
+                .map_or_else(|()| value.clone(), Value::Number)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn normalize_json_number(number: &Number) -> Option<Number> {
+    number
+        .as_i64()
+        .map(Number::from)
+        .or_else(|| number.as_u64().map(Number::from))
+        .or_else(|| number.as_f64().and_then(number_from_f64_canonical))
+}
+
 fn round_json_number(value: &Value) -> Value {
     value.as_f64().map_or_else(
         || value.clone(),
@@ -332,9 +430,105 @@ fn round_json_number(value: &Value) -> Value {
     )
 }
 
+pub(crate) fn round_numberish_json(value: &Value) -> Value {
+    let normalized = normalize_numberish_json(value);
+    round_json_number(&normalized)
+}
+
+fn number_from_f64_canonical(number: f64) -> Option<Number> {
+    integral_f64_to_i64(number)
+        .map(Number::from)
+        .or_else(|| Number::from_f64(number))
+}
+
 fn integral_f64_to_i64(float: f64) -> Option<i64> {
     if !float.is_finite() || float.fract() != 0.0 {
         return None;
     }
     format!("{float:.0}").parse::<i64>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_ils_numeric_strings_without_quotes() {
+        let mut row = Map::new();
+        row.insert("ID".to_string(), Value::String("8997".to_string()));
+        row.insert("RunwayID".to_string(), Value::String("19492".to_string()));
+        row.insert("Freq".to_string(), Value::String("17911808".to_string()));
+        row.insert(
+            "GsAngle".to_string(),
+            Value::String("2.9800000190734863".to_string()),
+        );
+        row.insert(
+            "Latitude".to_string(),
+            Value::String("45.83253056".to_string()),
+        );
+        row.insert(
+            "Longitude".to_string(),
+            Value::String("-88.11090278".to_string()),
+        );
+        row.insert("Category".to_string(), Value::String("1".to_string()));
+        row.insert("Ident".to_string(), Value::String("IIMT".to_string()));
+        row.insert(
+            "LocCourse".to_string(),
+            Value::String("9.600000381469727".to_string()),
+        );
+        row.insert(
+            "CrossingHeight".to_string(),
+            Value::String("53".to_string()),
+        );
+        row.insert("Elevation".to_string(), Value::String("1126".to_string()));
+        row.insert("HasDme".to_string(), Value::String("0".to_string()));
+
+        let formatted = format_row(row, "Ilses", None);
+
+        assert!(formatted.get("Category").is_some_and(Value::is_number));
+        assert!(
+            formatted
+                .get("CrossingHeight")
+                .is_some_and(Value::is_number)
+        );
+        assert!(formatted.get("RunwayID").is_some_and(Value::is_number));
+        assert!(formatted.get("LocCourse").is_some_and(Value::is_number));
+        assert!(formatted.get("GsAngle").is_some_and(Value::is_number));
+        assert_eq!(json_to_i64(formatted.get("Category")), Some(1));
+        assert_eq!(json_to_i64(formatted.get("CrossingHeight")), Some(53));
+    }
+
+    #[test]
+    fn formats_runway_numeric_strings_without_touching_string_ident() {
+        let mut row = Map::new();
+        row.insert("ID".to_string(), Value::String("12".to_string()));
+        row.insert("AirportID".to_string(), Value::String("34".to_string()));
+        row.insert("Ident".to_string(), Value::String("03".to_string()));
+        row.insert("TrueHeading".to_string(), Value::String("31.5".to_string()));
+        row.insert("Length".to_string(), Value::String("3800".to_string()));
+        row.insert("Width".to_string(), Value::String("45".to_string()));
+        row.insert("Surface".to_string(), Value::String("1".to_string()));
+        row.insert(
+            "Latitude".to_string(),
+            Value::String("31.19790123".to_string()),
+        );
+        row.insert(
+            "Longitude".to_string(),
+            Value::String("121.33670123".to_string()),
+        );
+        row.insert("Elevation".to_string(), Value::String("10".to_string()));
+
+        let formatted = format_row(row, "Runways", None);
+
+        assert!(formatted.get("AirportID").is_some_and(Value::is_number));
+        assert!(formatted.get("TrueHeading").is_some_and(Value::is_number));
+        assert!(formatted.get("Length").is_some_and(Value::is_number));
+        assert!(formatted.get("Width").is_some_and(Value::is_number));
+        assert!(formatted.get("Surface").is_some_and(Value::is_number));
+        assert!(formatted.get("Elevation").is_some_and(Value::is_number));
+        assert_eq!(
+            formatted.get("Ident"),
+            Some(&Value::String("03".to_string()))
+        );
+    }
 }

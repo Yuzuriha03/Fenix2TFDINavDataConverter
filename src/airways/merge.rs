@@ -58,7 +58,6 @@ struct InsertPath<'a> {
     to_idx: usize,
 }
 
-
 impl InsertPath<'_> {
     const fn point_count(&self) -> usize {
         self.from_idx.abs_diff(self.to_idx) + 1

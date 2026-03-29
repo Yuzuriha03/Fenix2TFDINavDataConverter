@@ -11,7 +11,9 @@ use serde::Deserialize;
 use serde::ser::{Serialize, SerializeStruct, Serializer};
 use serde_json::{Number, Value};
 
-use crate::db_json::{configure_read_connection, json_to_i64, sql_value_to_json};
+use crate::db_json::{
+    configure_read_connection, json_to_i64, normalize_numberish_json, sql_value_to_json,
+};
 use crate::stats::{PhaseDurations, TerminalLegExportStats, TerminalLegTimingBreakdown};
 use crate::terminal_filters::is_excluded_terminal;
 use crate::waypoints::{NavaidIdIndex, ReferenceIdIndex, WaypointIdIndex};
@@ -86,40 +88,40 @@ impl TerminalLegRecord {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         let id = row.get::<_, i64>(0)?;
         let terminal_id = row.get::<_, i64>(1)?;
-        let wpt_id = sql_value_to_json(row.get(5)?);
-        let nav_id = sql_value_to_json(row.get(9)?);
+        let wpt_id = normalize_numberish_json(&sql_value_to_json(row.get(5)?));
+        let nav_id = normalize_numberish_json(&sql_value_to_json(row.get(9)?));
         let alt = sql_value_to_json(row.get(16)?);
-        let vnav = sql_value_to_json(row.get(17)?);
-        let center_id = sql_value_to_json(row.get(18)?);
-        let is_fly_over = sql_value_to_json(row.get(21)?);
-        let speed_limit = sql_value_to_json(row.get(22)?);
+        let vnav = normalize_numberish_json(&sql_value_to_json(row.get(17)?));
+        let center_id = normalize_numberish_json(&sql_value_to_json(row.get(18)?));
+        let is_fly_over = normalize_numberish_json(&sql_value_to_json(row.get(21)?));
+        let speed_limit = normalize_numberish_json(&sql_value_to_json(row.get(22)?));
         let is_map = matches!(&alt, Value::String(text) if text == "MAP");
         Ok(Self {
             id,
             terminal_id,
-            leg_type: sql_value_to_json(row.get(2)?),
+            leg_type: normalize_numberish_json(&sql_value_to_json(row.get(2)?)),
             transition: sql_value_to_json(row.get(3)?),
             track_code: sql_value_to_json(row.get(4)?),
             wpt_id_num: json_to_i64(Some(&wpt_id)),
             wpt_id,
-            wpt_lat: sql_value_to_json(row.get(6)?),
-            wpt_lon: sql_value_to_json(row.get(7)?),
+            wpt_lat: normalize_numberish_json(&sql_value_to_json(row.get(6)?)),
+            wpt_lon: normalize_numberish_json(&sql_value_to_json(row.get(7)?)),
             turn_dir: sql_value_to_json(row.get(8)?),
             nav_id_num: json_to_i64(Some(&nav_id)),
             nav_id,
-            nav_lat: sql_value_to_json(row.get(10)?),
-            nav_lon: sql_value_to_json(row.get(11)?),
-            nav_bear: sql_value_to_json(row.get(12)?),
-            nav_dist: sql_value_to_json(row.get(13)?),
-            course: sql_value_to_json(row.get(14)?),
-            distance: sql_value_to_json(row.get(15)?),
+            nav_lat: normalize_numberish_json(&sql_value_to_json(row.get(10)?)),
+            nav_lon: normalize_numberish_json(&sql_value_to_json(row.get(11)?)),
+            nav_bear: normalize_numberish_json(&sql_value_to_json(row.get(12)?)),
+            nav_dist: normalize_numberish_json(&sql_value_to_json(row.get(13)?)),
+            course: normalize_numberish_json(&sql_value_to_json(row.get(14)?)),
+            distance: normalize_numberish_json(&sql_value_to_json(row.get(15)?)),
             alt,
             vnav_num: parse_vnav(Some(&vnav)),
             vnav,
             center_id_num: json_to_i64(Some(&center_id)),
             center_id,
-            center_lat: sql_value_to_json(row.get(19)?),
-            center_lon: sql_value_to_json(row.get(20)?),
+            center_lat: normalize_numberish_json(&sql_value_to_json(row.get(19)?)),
+            center_lon: normalize_numberish_json(&sql_value_to_json(row.get(20)?)),
             is_fly_over_num: json_to_i64(Some(&is_fly_over)),
             is_fly_over,
             speed_limit_num: json_to_i64(Some(&speed_limit)),
